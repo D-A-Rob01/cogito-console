@@ -5,6 +5,8 @@ const els = {
   sessionId: document.querySelector("#sessionId"),
   socketState: document.querySelector("#socketState"),
   meshState: document.querySelector("#meshState"),
+  providerState: document.querySelector("#providerState"),
+  expertToggle: document.querySelector("#expertToggle"),
   tokenCount: document.querySelector("#tokenCount"),
   rewriteCount: document.querySelector("#rewriteCount"),
   graphCanvas: document.querySelector("#graphCanvas"),
@@ -13,6 +15,7 @@ const els = {
   selectedToken: document.querySelector("#selectedToken"),
   alternatives: document.querySelector("#alternatives"),
   hiddenState: document.querySelector("#hiddenState"),
+  comparePanel: document.querySelector("#comparePanel"),
 };
 
 const state = {
@@ -31,11 +34,14 @@ const state = {
   camera: { x: 50, y: 50, scale: 1 },
   rewrites: 0,
   events: [],
+  provider: null,
+  expertMode: false,
+  lastComparison: null,
 };
 
 function connect() {
   const protocol = location.protocol === "https:" ? "wss" : "ws";
-  state.socket = new WebSocket(`${protocol}://${location.host}/ws/auratrack/${state.sessionId}`);
+  state.socket = new WebSocket(`${protocol}://${location.host}/ws/cogito/${state.sessionId}`);
   els.sessionId.textContent = state.sessionId.slice(0, 8);
 
   state.socket.addEventListener("open", () => {
@@ -73,9 +79,10 @@ function startStream() {
   state.pendingSteer = null;
   state.collapsedBranches = [];
   state.originTokenId = null;
+  state.lastComparison = null;
   state.camera = { x: 50, y: 50, scale: 1 };
   els.meshState.textContent = "routing";
-  addEvent("Confluence Router started");
+  addEvent("prompt checks started");
   renderAll();
   send({ type: "start", prompt: els.prompt.value });
 }
@@ -83,20 +90,22 @@ function startStream() {
 function receive(message) {
   switch (message.type) {
     case "session_open":
+      state.provider = message.provider;
+      els.providerState.textContent = providerLabel(message.provider);
       addEvent(`session ${message.session_id.slice(0, 8)} opened`);
       break;
     case "router_started":
       els.meshState.textContent = "routing";
-      addEvent("parallel micro-validations running");
+      addEvent("prompt checks running");
       break;
     case "router_complete":
       state.subContext = message.sub_context;
-      addEvent("Confluence Router complete");
+      addEvent("prompt checks complete");
       break;
     case "mesh_manifested":
       state.mesh = message.mesh;
       els.meshState.textContent = "active";
-      addEvent("Epigenetic Mesh manifested");
+      addEvent("session context manifested");
       break;
     case "token":
       upsertToken(message.packet);
@@ -109,6 +118,10 @@ function receive(message) {
       break;
     case "stream_complete":
       addEvent("stream complete");
+      break;
+    case "provider_unavailable":
+      els.providerState.textContent = "unavailable";
+      addEvent(message.message || "provider unavailable");
       break;
     case "mesh_evaporated":
       els.meshState.textContent = message.mesh.status;
@@ -154,10 +167,23 @@ function applyHistoryRewrite(message) {
       token,
       alternatives: prior?.alternatives || [],
       hidden_state: prior?.hidden_state || {},
+      hidden_state_metrics: prior?.hidden_state_metrics || {},
+      metrics: prior?.metrics || {},
+      token_event: prior?.token_event || null,
       logprob: index === message.token_id ? message.alternative.logprob : prior?.logprob,
       rewritten: index === message.token_id,
     };
   });
+  state.lastComparison = {
+    tokenId: message.token_id,
+    before: message.rewrite_event?.previous_text || state.pendingSteer?.oldTokens?.map((token) => token.token).join("") || "",
+    after: message.rewrite_event?.rewritten_text || message.text,
+    changedToken: message.replacement,
+    oldRunId: message.rewrite_event?.old_run_id,
+    newRunId: message.rewrite_event?.new_run_id || message.run_id,
+    rationale: message.rewrite_event?.rationale || message.alternative?.rationale,
+    alternative: message.alternative,
+  };
   state.tokens = nextTokens;
   state.originTokenId = message.token_id;
   state.selectedTokenId = message.token_id;
@@ -165,7 +191,7 @@ function applyHistoryRewrite(message) {
   state.pausedGraphTokens = null;
   state.hoverGhost = null;
   state.pendingSteer = null;
-  addEvent(`Rewrite From Token ${message.token_id}: ${JSON.stringify(message.replacement.trim())}`);
+  addEvent(`Path changed at token ${message.token_id}: ${JSON.stringify(message.replacement.trim())}`);
 }
 
 function handleAlternativeClick(tokenId, alternative) {
@@ -206,6 +232,7 @@ function renderAll() {
   renderTokenStream();
   renderInspector();
   renderEvents();
+  renderCompare();
 }
 
 function renderGraph() {
@@ -243,8 +270,8 @@ function renderGraph() {
 
   const nodes = [
     node("Prompt", "ingest", 12, 50, "active system-node"),
-    node("Confluence", contextVerdict("constraint_bounds"), 17, 28, state.subContext ? "active system-node" : "system-node"),
-    node("Latent Beam", "dominant path", 17, 72, visible.length ? "active system-node" : "system-node"),
+    node("Prompt checks", contextVerdict("constraint_bounds"), 17, 28, state.subContext ? "active system-node" : "system-node"),
+    node("Live path", "accepted tokens", 17, 72, visible.length ? "active system-node" : "system-node"),
     ...tokenNodes,
     ...ghostNodes,
     ...collapsed.nodes,
@@ -295,7 +322,9 @@ function node(title, subtitle, x, y, className = "", tokenId = null) {
 }
 
 function tokenNode(packet, coordinate) {
-  const weight = logprobWeight(packet.logprob);
+  const logprob = tokenMetric(packet, "logprob");
+  const probability = tokenMetric(packet, "probability");
+  const weight = logprobWeight(metricValue(logprob, packet.logprob));
   const isPendingDiscard = state.pendingSteer && packet.token_id >= state.pendingSteer.tokenId;
   const className = [
     "dominant-node",
@@ -307,15 +336,17 @@ function tokenNode(packet, coordinate) {
   return `
     <button class="graph-node ${className}" data-token-id="${packet.token_id}" style="left:${coordinate.x}%; top:${coordinate.y}%; --node-weight:${weight};">
       <strong>${escapeHtml(cleanToken(packet.token))}</strong>
-      <span>logprob ${escapeHtml(packet.logprob ?? "pending")}</span>
+      <span>${statusBadgeHtml(probability?.status || logprob?.status)} ${escapeHtml(metricSummary(probability, packet.probability, "probability"))}</span>
     </button>
   `;
 }
 
 function ghostNode(packet, alternative, alternativeIndex, tokenCoordinate) {
   const coordinate = ghostCoordinates(tokenCoordinate, alternativeIndex);
-  const weight = logprobWeight(alternative.logprob);
-  const probability = probabilityFromLogprob(alternative.logprob);
+  const logprob = alternativeMetric(alternative, "logprob");
+  const probability = alternativeMetric(alternative, "probability");
+  const weight = logprobWeight(metricValue(logprob, alternative.logprob));
+  const probabilityValue = metricValue(probability, alternative.probability ?? probabilityFromLogprob(alternative.logprob));
   return `
     <button
       class="ghost-node"
@@ -327,25 +358,30 @@ function ghostNode(packet, alternative, alternativeIndex, tokenCoordinate) {
       aria-label="Steer token ${packet.token_id} to ${escapeHtml(cleanToken(alternative.token))}"
     >
       <strong>${escapeHtml(cleanToken(alternative.token))}</strong>
-      <span>${formatPercent(probability)}</span>
+      <span>${statusBadgeHtml(alternative.status || probability?.status)} ${formatPercent(probabilityValue)}</span>
     </button>
   `;
 }
 
 function ghostDashboard(ghost) {
-  const probability = probabilityFromLogprob(ghost.alternative.logprob);
+  const logprob = alternativeMetric(ghost.alternative, "logprob");
+  const probability = alternativeMetric(ghost.alternative, "probability");
+  const probabilityValue = metricValue(probability, ghost.alternative.probability ?? probabilityFromLogprob(ghost.alternative.logprob));
   const left = Math.min(78, Math.max(12, ghost.origin.x + 4));
   const top = Math.min(78, Math.max(10, ghost.origin.y - 10));
   return `
     <aside class="ghost-dashboard" style="left:${left}%; top:${top}%;">
-      <div>Ghost Pathway</div>
+      <div>Alternative path ${statusBadgeHtml(ghost.alternative.status || probability?.status)}</div>
       <strong>${escapeHtml(JSON.stringify(ghost.alternative.token))}</strong>
       <dl>
         <dt>token_id</dt><dd>${ghost.packet.token_id}</dd>
-        <dt>logprob</dt><dd>${ghost.alternative.logprob}</dd>
-        <dt>probability</dt><dd>${formatPercent(probability)}</dd>
+        <dt>logprob</dt><dd>${escapeHtml(metricSummary(logprob, ghost.alternative.logprob, "logprob"))}</dd>
+        <dt>probability</dt><dd>${escapeHtml(metricSummary(probability, probabilityValue, "probability"))}</dd>
+        <dt>evidence</dt><dd>${escapeHtml(probability?.evidence_id || logprob?.evidence_id || "none")}</dd>
       </dl>
+      <p><b>What it means:</b> ${escapeHtml(probability?.plain_explanation || "An alternate continuation available at this token.")}</p>
       <p>${escapeHtml(ghost.alternative.rationale || "Alternative semantic branch.")}</p>
+      ${state.expertMode ? rawBlock("Alternative metric", ghost.alternative.metrics || {}) : ""}
     </aside>
   `;
 }
@@ -415,21 +451,35 @@ function renderInspector() {
     return;
   }
 
+  const logprob = tokenMetric(packet, "logprob");
+  const probability = tokenMetric(packet, "probability");
+  const latency = tokenMetric(packet, "latency_ms");
   els.selectedToken.className = "selected-token";
   els.selectedToken.innerHTML = `
-    <strong>Token ${packet.token_id}</strong><br />
-    <code>${escapeHtml(JSON.stringify(packet.token))}</code><br />
-    <span>logprob ${packet.logprob ?? "pending"}</span>
+    <strong>Token ${packet.token_id}</strong> ${statusBadgeHtml(probability?.status || logprob?.status)}<br />
+    <code>${escapeHtml(JSON.stringify(packet.token))}</code>
+    <dl class="metric-list">
+      <dt>Probability</dt><dd>${escapeHtml(metricSummary(probability, packet.probability, "probability"))}</dd>
+      <dt>Logprob</dt><dd>${escapeHtml(metricSummary(logprob, packet.logprob, "logprob"))}</dd>
+      <dt>Latency</dt><dd>${escapeHtml(metricSummary(latency, null, "ms"))}</dd>
+      <dt>Evidence</dt><dd>${escapeHtml(probability?.evidence_id || logprob?.evidence_id || "none")}</dd>
+    </dl>
+    <p><b>Why this number?</b> ${escapeHtml(probability?.plain_explanation || logprob?.plain_explanation || "No probability metric was returned for this token.")}</p>
+    <p><b>Where did this come from?</b> ${escapeHtml(sourceLine(packet, probability || logprob))}</p>
+    ${state.expertMode ? rawBlock("Raw token event", packet.token_event || packet) : ""}
   `;
 
   els.alternatives.innerHTML = "";
   for (const alternative of packet.alternatives || []) {
+    const alternativeLogprob = alternativeMetric(alternative, "logprob");
+    const alternativeProbability = alternativeMetric(alternative, "probability");
     const button = document.createElement("button");
     button.className = "alternative-button";
     button.innerHTML = `
       <code>${escapeHtml(JSON.stringify(alternative.token))}</code>
-      <span>${alternative.logprob}</span>
-      <small>${escapeHtml(alternative.rationale || "Rewrite model history from this point.")}</small>
+      <span>${statusBadgeHtml(alternative.status || alternativeProbability?.status)} ${escapeHtml(metricSummary(alternativeProbability, alternative.probability, "probability"))}</span>
+      <small><b>Use this path</b> ${escapeHtml(alternative.rationale || "Rewrite model history from this point.")}</small>
+      <small>Evidence: ${escapeHtml(alternativeProbability?.evidence_id || alternativeLogprob?.evidence_id || "none")}</small>
     `;
     button.addEventListener("click", () => handleAlternativeClick(packet.token_id, alternative));
     els.alternatives.append(button);
@@ -437,12 +487,13 @@ function renderInspector() {
 
   els.hiddenState.innerHTML = "";
   for (const [key, value] of Object.entries(packet.hidden_state || {})) {
+    const metric = packet.hidden_state_metrics?.[key] || syntheticLegacySignal(key, value);
     const row = document.createElement("div");
     row.className = "state-row";
     row.innerHTML = `
-      <span>${escapeHtml(key)}</span>
+      <span>${escapeHtml(metric.display_label || key)} ${statusBadgeHtml(metric.status)}</span>
       <span class="bar"><i style="--value:${Math.round(value * 100)}%"></i></span>
-      <b>${value}</b>
+      <b title="${escapeHtml(metric.plain_explanation)}">${value}</b>
     `;
     els.hiddenState.append(row);
   }
@@ -455,6 +506,33 @@ function renderEvents() {
     .join("");
 }
 
+function renderCompare() {
+  if (!state.lastComparison) {
+    els.comparePanel.className = "compare-panel empty";
+    els.comparePanel.textContent = "Change a path to compare branches.";
+    return;
+  }
+  const comparison = state.lastComparison;
+  const probability = alternativeMetric(comparison.alternative || {}, "probability");
+  const logprob = alternativeMetric(comparison.alternative || {}, "logprob");
+  els.comparePanel.className = "compare-panel";
+  els.comparePanel.innerHTML = `
+    <div class="panel-title">Compare branches</div>
+    <p>You changed the path at token ${comparison.tokenId}. The system restarted from that point with the selected token.</p>
+    <dl class="metric-list">
+      <dt>Changed token</dt><dd><code>${escapeHtml(JSON.stringify(comparison.changedToken))}</code></dd>
+      <dt>Selected metric</dt><dd>${escapeHtml(metricSummary(probability || logprob, comparison.alternative?.logprob, "probability/logprob"))}</dd>
+      <dt>Old run</dt><dd>${escapeHtml(comparison.oldRunId || "unknown")}</dd>
+      <dt>New run</dt><dd>${escapeHtml(comparison.newRunId || "unknown")}</dd>
+    </dl>
+    <div class="branch-text">
+      <section><b>Before</b><p>${escapeHtml(comparison.before || "(empty)")}</p></section>
+      <section><b>After</b><p>${escapeHtml(comparison.after || "(empty)")}</p></section>
+    </div>
+    ${comparison.rationale ? `<p><b>Why it matters:</b> ${escapeHtml(comparison.rationale)}</p>` : ""}
+  `;
+}
+
 function addEvent(text) {
   const timestamp = new Date().toLocaleTimeString([], { hour12: false });
   state.events.push(`${timestamp} ${text}`);
@@ -464,7 +542,7 @@ function addEvent(text) {
 function contextVerdict(key) {
   const item = state.subContext?.[key];
   if (!item) return "pending";
-  return `${Math.round(item.confidence * 100)}% ${item.signals?.[0] || "validated"}`;
+  return `${Math.round(item.confidence * 100)}% SYNTHETIC ${item.signals?.[0] || "validated"}`;
 }
 
 function getGraphTokens() {
@@ -533,6 +611,74 @@ function focusCameraOn(x, y) {
   return { x, y, scale: 1.08 };
 }
 
+function tokenMetric(packet, name) {
+  if (name === "logprob") return packet.token_event?.logprob || packet.metrics?.token_logprob || null;
+  if (name === "probability") return packet.token_event?.probability || packet.metrics?.token_probability || null;
+  if (name === "latency_ms") return packet.token_event?.latency_ms || packet.metrics?.token_latency_ms || null;
+  if (name === "byte_length") return packet.token_event?.byte_length || packet.metrics?.byte_length || null;
+  return packet.metrics?.[name] || null;
+}
+
+function alternativeMetric(alternative, name) {
+  return alternative.metrics?.[name] || alternative.metrics?.[`alternative_${alternative.rank}_${name}`] || null;
+}
+
+function metricValue(metric, fallback = null) {
+  const value = metric?.value ?? fallback;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : value;
+}
+
+function metricSummary(metric, fallback = null, unitHint = "") {
+  if (!metric && fallback === null) return "not returned";
+  const value = metricValue(metric, fallback);
+  if (value === null || value === undefined) return "not returned";
+  const unit = metric?.unit || unitHint;
+  if (unit === "probability") return `${formatPercent(Number(value))} (${metric?.status || "unknown"})`;
+  if (unit === "ms") return `${Number(value).toFixed(1)}ms (${metric?.status || "unknown"})`;
+  if (typeof value === "number") return `${Number(value).toFixed(3)} ${unit}`.trim() + ` (${metric?.status || "unknown"})`;
+  return `${value} (${metric?.status || "unknown"})`;
+}
+
+function statusBadgeHtml(status = "unknown") {
+  return `<span class="status-badge ${escapeHtml(status)}">${escapeHtml(String(status).toUpperCase())}</span>`;
+}
+
+function sourceLine(packet, metric) {
+  if (!metric) return "No provider or runtime source was attached.";
+  const evidence = (packet.evidence || []).find((record) => record.evidence_id === metric.evidence_id);
+  if (!evidence) return `Evidence record ${metric.evidence_id} is referenced but not in this packet.`;
+  const field = evidence.source_field ? ` field ${evidence.source_field}` : "";
+  const caveat = evidence.caveat ? ` Caveat: ${evidence.caveat}` : "";
+  return `${evidence.source_kind.toUpperCase()} from ${evidence.source_name}${field}.${caveat}`;
+}
+
+function providerLabel(provider) {
+  if (!provider) return "unknown";
+  return provider.available === false ? `${provider.mode}: unavailable` : provider.mode;
+}
+
+function rawBlock(label, value) {
+  return `
+    <details class="raw-details">
+      <summary>${escapeHtml(label)}</summary>
+      <pre>${escapeHtml(JSON.stringify(value, null, 2))}</pre>
+    </details>
+  `;
+}
+
+function syntheticLegacySignal(key, value) {
+  return {
+    name: `legacy_${key}`,
+    value,
+    unit: "score",
+    status: "synthetic",
+    evidence_id: "legacy-unpersisted",
+    display_label: key.replaceAll("_", " "),
+    plain_explanation: "Legacy local signal; treated as synthetic because no provider evidence was attached.",
+  };
+}
+
 function logprobWeight(logprob) {
   const value = Number(logprob);
   if (!Number.isFinite(value)) return 0.45;
@@ -577,6 +723,10 @@ function escapeHtml(value) {
 
 els.start.addEventListener("click", startStream);
 els.evaporate.addEventListener("click", evaporate);
+els.expertToggle.addEventListener("change", () => {
+  state.expertMode = els.expertToggle.checked;
+  renderAll();
+});
 connect();
 renderAll();
 

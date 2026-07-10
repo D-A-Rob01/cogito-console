@@ -3,6 +3,7 @@ __pycache__/
 *$py.class
 
 .pytest_cache/
+.pytest-tmp*/
 .ruff_cache/
 .mypy_cache/
 .coverage
@@ -21,3 +22,8 @@ node_modules/
 dist/
 build/
 
+*.egg-info/
+data/
+*.sqlite
+*.sqlite-*
+cogito-console-*.png

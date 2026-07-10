@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AuraTrack</title>
+    <title>Cogito Console</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
@@ -13,8 +13,8 @@
         <div class="brand-row">
           <span class="brand-mark"></span>
           <div>
-            <h1>AuraTrack</h1>
-            <p>Introspective Orchestration and Synaptic Steering</p>
+            <h1>Cogito Console</h1>
+            <p>Local AI observability and steering console</p>
           </div>
         </div>
 
@@ -22,9 +22,14 @@
         <textarea id="promptInput" spellcheck="false">Build a middleware architecture that exposes sub-perceptual nerves, streams logprob alternatives, and lets the operator rewrite model history mid-stream.</textarea>
 
         <div class="button-row">
-          <button id="startButton" class="primary">Start Stream</button>
-          <button id="evaporateButton">Evaporate</button>
+          <button id="startButton" class="primary">Start</button>
+          <button id="evaporateButton">Clear run</button>
         </div>
+
+        <label class="toggle-row">
+          <input id="expertToggle" type="checkbox" />
+          <span>Expert mode</span>
+        </label>
 
         <section class="status-stack">
           <div>
@@ -39,14 +44,18 @@
             <span>Mesh</span>
             <strong id="meshState">idle</strong>
           </div>
+          <div>
+            <span>Provider</span>
+            <strong id="providerState">checking</strong>
+          </div>
         </section>
       </aside>
 
       <section class="graph-stage">
         <header class="stage-header">
           <div>
-            <h2>Live Inference Graph</h2>
-            <p>Confluence Router -> Latent Beam -> Epigenetic Mesh</p>
+            <h2>Live Graph</h2>
+            <p>Prompt checks -> Live path -> Session context</p>
           </div>
           <div class="stream-metrics">
             <span><b id="tokenCount">0</b> tokens</span>
@@ -54,27 +63,28 @@
           </div>
         </header>
 
-        <div id="graphCanvas" class="graph-canvas" aria-label="Live AuraTrack graph"></div>
+        <div id="graphCanvas" class="graph-canvas" aria-label="Live Cogito graph"></div>
 
         <section class="transcript-panel">
-          <div class="panel-title">Steering Hooks</div>
+          <div class="panel-title">Token stream</div>
           <div id="tokenStream" class="token-stream" aria-live="polite"></div>
         </section>
 
         <section class="event-panel">
-          <div class="panel-title">Event Stream</div>
+          <div class="panel-title">Event timeline</div>
           <ol id="eventLog"></ol>
+          <div id="comparePanel" class="compare-panel empty">Change a path to compare branches.</div>
         </section>
       </section>
 
       <aside class="inspector">
-        <div class="panel-title">Latent Beam</div>
-        <div id="selectedToken" class="selected-token empty">Click a streamed token to inspect its alternatives.</div>
+        <div class="panel-title">Inspector</div>
+        <div id="selectedToken" class="selected-token empty">Click a number, token, or branch to inspect where it came from.</div>
 
-        <div class="panel-title">Alternative Logprobs</div>
+        <div class="panel-title">Alternatives</div>
         <div id="alternatives" class="alternatives"></div>
 
-        <div class="panel-title">Hidden State</div>
+        <div class="panel-title">Signal panel</div>
         <div id="hiddenState" class="hidden-state"></div>
       </aside>
     </main>

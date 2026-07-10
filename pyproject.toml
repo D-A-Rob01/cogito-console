@@ -1,7 +1,7 @@
 [project]
-name = "auratrack"
-version = "0.1.0"
-description = "Introspective orchestration and synaptic steering framework demo."
+name = "cogito-console"
+version = "0.2.0"
+description = "Cogito Console: auditable local AI steering and inference-event visualization."
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.138.0",
@@ -13,6 +13,9 @@ dev = [
   "pytest>=9.1.0",
   "websockets>=16.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["cogito_console"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
