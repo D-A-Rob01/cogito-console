@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from .graph import build_context_graph, build_rewrite_graph, build_router_graph, build_token_graph, router_validation_events
@@ -19,9 +19,22 @@ from .lifecycle_logger import ContextGraphLifecycleLogger
 from .memory import EpigeneticMemoryController
 from .metrics import MetricEngine
 from .persistence import PersistenceStore
-from .providers import ProviderStreamPacket, ProviderUnavailableError, OpenAIAdapter, adapter_from_env
+from .providers import (
+    LocalDemoAdapter,
+    OpenAIAdapter,
+    ProviderStreamPacket,
+    ProviderUnavailableError,
+    adapter_from_env,
+)
 from .router import ConfluenceRouter
-from .schemas import RewriteEvent, make_evidence
+from .schemas import (
+    EvidenceRecord,
+    MetricValue,
+    RewriteEvent,
+    TelemetryEvent,
+    make_evidence,
+    make_unavailable_metric,
+)
 from .transaction_log import TokenTransactionLog
 
 
@@ -57,6 +70,7 @@ class RuntimeSession:
     router_events: list[dict[str, Any]] = field(default_factory=list)
     graph_nodes: list[dict[str, Any]] = field(default_factory=list)
     graph_edges: list[dict[str, Any]] = field(default_factory=list)
+    telemetry_sequence: int = 0
 
     def begin_stream(self) -> "StreamCancellationToken":
         self.cancellation_token = StreamCancellationToken(self.run_id)
@@ -71,6 +85,12 @@ class RuntimeSession:
         flushed = len(self.stream_buffer)
         self.stream_buffer.clear()
         return flushed
+
+    def stamp_events(self, events: list[TelemetryEvent]) -> list[TelemetryEvent]:
+        for event in events:
+            self.telemetry_sequence += 1
+            event.sequence = self.telemetry_sequence
+        return events
 
 
 class StreamCancellationToken:
@@ -130,14 +150,17 @@ async def get_session_metrics(session_id: str) -> list[dict[str, Any]]:
 
 @app.get("/api/providers")
 async def get_providers() -> dict[str, Any]:
+    demo_adapter = LocalDemoAdapter(interceptor=interceptor)
     openai_adapter = OpenAIAdapter()
+    providers = {
+        adapter.describe()["provider_id"]: adapter.describe()
+        for adapter in (provider_adapter, demo_adapter, openai_adapter)
+    }
     return {
         "active": provider_adapter.describe(),
-        "available": [
-            provider_adapter.describe(),
-            openai_adapter.describe(),
-        ],
+        "available": list(providers.values()),
         "synthetic_policy": "Synthetic demo metrics are emitted only with status='synthetic' and evidence records.",
+        "missing_data_policy": "Unsupported measurements are emitted with status='unavailable' and a capability-specific reason.",
     }
 
 
@@ -147,6 +170,16 @@ async def get_evidence(evidence_id: str) -> dict[str, Any]:
     if evidence is None:
         raise HTTPException(status_code=404, detail="evidence not found")
     return evidence
+
+
+@app.get("/api/sessions/{session_id}/telemetry")
+async def get_session_telemetry(session_id: str) -> list[dict[str, Any]]:
+    return persistence_store.get_telemetry_events(session_id)
+
+
+@app.get("/api/sessions/{session_id}/export.jsonl", response_class=PlainTextResponse)
+async def export_session_telemetry(session_id: str) -> str:
+    return persistence_store.export_telemetry_jsonl(session_id)
 
 
 @app.websocket("/ws/cogito/{session_id}")
@@ -201,6 +234,7 @@ async def start_session(websocket: WebSocket, session: RuntimeSession, prompt: s
     session.router_events = []
     session.graph_nodes = []
     session.graph_edges = []
+    session.telemetry_sequence = 0
     persistence_store.upsert_session(
         session.session_id,
         prompt=session.prompt,
@@ -211,6 +245,32 @@ async def start_session(websocket: WebSocket, session: RuntimeSession, prompt: s
         session.run_id,
         session_id=session.session_id,
         payload={"provider": provider_adapter.describe(), "rewrite_index": session.rewrites},
+    )
+
+    capability_record = provider_adapter.capability_record()
+    capability_events, capability_evidence, unavailable_metrics = _capability_events(
+        session, capability_record.to_dict()
+    )
+    session.stamp_events(capability_events)
+    persistence_store.save_capability_snapshot(
+        session.session_id, session.run_id, capability_record
+    )
+    persistence_store.save_evidence_records(session.session_id, capability_evidence)
+    persistence_store.save_metrics(
+        session.session_id, f"capabilities:{session.run_id}", unavailable_metrics
+    )
+    persistence_store.save_telemetry_events(capability_events)
+    await websocket.send_json(
+        {
+            "type": "provider_capabilities",
+            "provider": provider_adapter.describe(),
+            "capability_record": capability_record.to_dict(),
+            "unavailable_measurements": [
+                metric.to_dict() for metric in unavailable_metrics
+            ],
+            "telemetry_events": [event.to_dict() for event in capability_events],
+            "evidence": [record.to_dict() for record in capability_evidence],
+        }
     )
 
     await websocket.send_json({"type": "router_started", "session_id": session.session_id})
@@ -361,7 +421,9 @@ async def stream_run(websocket: WebSocket, session: RuntimeSession) -> None:
         async for provider_packet in stream_with_cancellation(packet_source, cancellation_token):
             if run_id != session.run_id or cancellation_token.cancelled:
                 return
-            packet = provider_packet.to_legacy_packet()
+            telemetry_events = provider_packet.ensure_telemetry_events(provider_adapter.name)
+            session.stamp_events(telemetry_events)
+            packet = provider_packet.to_legacy_packet(provider_adapter.name)
             session.stream_buffer.append(packet)
             session.token_log.append_packet(packet)
             packet["committed_history"] = session.token_log.history()
@@ -375,6 +437,7 @@ async def stream_run(websocket: WebSocket, session: RuntimeSession) -> None:
             }
             session.packets[packet["token_id"]] = packet
             persistence_store.save_token_packet(session.session_id, packet)
+            persistence_store.save_telemetry_events(telemetry_events)
             persistence_store.save_graph(session.session_id, token_nodes, token_edges)
             await websocket.send_json({"type": "token", "packet": packet})
             session.stream_buffer.clear()
@@ -409,6 +472,25 @@ async def stream_run(websocket: WebSocket, session: RuntimeSession) -> None:
                 [duration_evidence, speed_evidence, rewrite_evidence],
             )
             persistence_store.save_metrics(session.session_id, f"run:{run_id}", run_metrics)
+            completed_event = TelemetryEvent(
+                event_type="run.completed",
+                session_id=session.session_id,
+                run_id=run_id,
+                status="real",
+                source_name="Cogito Console runtime",
+                capability="streaming",
+                payload={
+                    "text": session.token_log.text(),
+                    "metrics": [metric.to_dict() for metric in run_metrics],
+                },
+                evidence_ids=[
+                    duration_evidence.evidence_id,
+                    speed_evidence.evidence_id,
+                    rewrite_evidence.evidence_id,
+                ],
+            )
+            session.stamp_events([completed_event])
+            persistence_store.save_telemetry_events([completed_event])
             await websocket.send_json(
                 {
                     "type": "stream_complete",
@@ -420,6 +502,7 @@ async def stream_run(websocket: WebSocket, session: RuntimeSession) -> None:
                         speed_evidence.to_dict(),
                         rewrite_evidence.to_dict(),
                     ],
+                    "telemetry_events": [completed_event.to_dict()],
                 }
             )
             lifecycle_logger.stream_completion_successful(session.session_id)
@@ -484,6 +567,73 @@ def evaporate_session_mesh(session_id: str) -> dict[str, Any]:
     result = memory_controller.evaporate_mesh(session_id)
     lifecycle_logger.evaporated(session_id, result)
     return result
+
+
+def _capability_events(
+    session: RuntimeSession,
+    capability_record: dict[str, Any],
+) -> tuple[list[TelemetryEvent], list[EvidenceRecord], list[MetricValue]]:
+    events = [
+        TelemetryEvent(
+            event_type="run.started",
+            session_id=session.session_id,
+            run_id=session.run_id,
+            status="real",
+            source_name="Cogito Console runtime",
+            capability="streaming",
+            payload={
+                "prompt_characters": len(session.prompt),
+                "provider_id": capability_record["provider_id"],
+            },
+        ),
+        TelemetryEvent(
+            event_type="provider.capabilities",
+            session_id=session.session_id,
+            run_id=session.run_id,
+            status="real",
+            source_name=capability_record["provider_name"],
+            capability="provider_capabilities",
+            payload={"capability_record": capability_record},
+        ),
+    ]
+    evidence: list[EvidenceRecord] = []
+    unavailable: list[MetricValue] = []
+    for capability_name, descriptor in capability_record["capabilities"].items():
+        if descriptor["support"] != "unsupported":
+            continue
+        record = make_evidence(
+            "provider",
+            capability_record["provider_name"],
+            f"capabilities.{capability_name}",
+            caveat=descriptor.get("limitation"),
+            capability=capability_name,
+        )
+        metric = make_unavailable_metric(
+            name=f"{capability_name}_availability",
+            display_label=capability_name.replace("_", " ").title(),
+            evidence=record,
+            capability=capability_name,
+            explanation=descriptor.get("limitation")
+            or "The active backend does not expose this measurement.",
+        )
+        evidence.append(record)
+        unavailable.append(metric)
+        events.append(
+            TelemetryEvent(
+                event_type="measurement.unavailable",
+                session_id=session.session_id,
+                run_id=session.run_id,
+                status="unavailable",
+                source_name=capability_record["provider_name"],
+                capability=capability_name,
+                payload={
+                    "metric": metric.to_dict(),
+                    "capability": descriptor,
+                },
+                evidence_ids=[record.evidence_id],
+            )
+        )
+    return events, evidence, unavailable
 
 
 if __name__ == "__main__":

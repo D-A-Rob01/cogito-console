@@ -7,8 +7,52 @@ from typing import Any, Literal
 
 
 SourceKind = Literal["provider", "runtime", "derived", "synthetic", "operator", "system"]
-MetricStatus = Literal["real", "derived", "synthetic"]
-GraphStatus = Literal["real", "derived", "synthetic", "operator", "system"]
+MetricStatus = Literal["real", "derived", "synthetic", "unavailable"]
+GraphStatus = Literal["real", "derived", "synthetic", "unavailable", "operator", "system"]
+CapabilitySupport = Literal["supported", "conditional", "unsupported"]
+TelemetryEventType = Literal[
+    "run.started",
+    "provider.capabilities",
+    "prompt.encoded",
+    "prefill.started",
+    "prefill.completed",
+    "token.sampled",
+    "token.committed",
+    "layer.summary",
+    "attention.summary",
+    "router.decision",
+    "expert.loaded",
+    "expert.cache_hit",
+    "kv.updated",
+    "resource.sample",
+    "steer.requested",
+    "run.cancelled",
+    "run.resumed",
+    "run.completed",
+    "measurement.unavailable",
+]
+TELEMETRY_SCHEMA_VERSION = "1.0"
+CAPABILITY_NAMES = (
+    "streaming",
+    "token_ids",
+    "selected_token_logprobs",
+    "top_k_alternatives",
+    "raw_logits",
+    "hidden_states",
+    "attentions",
+    "moe_router_logits",
+    "selected_experts",
+    "routing_weights",
+    "kv_cache_metrics",
+    "request_queue_metrics",
+    "system_resource_telemetry",
+    "deterministic_seed",
+    "structured_output",
+    "branch_replay",
+    "sampling_intervention",
+    "logit_intervention",
+    "activation_intervention",
+)
 NodeType = Literal[
     "prompt",
     "router",
@@ -44,6 +88,7 @@ class EvidenceRecord:
     source_field: str | None = None
     formula: str | None = None
     caveat: str | None = None
+    capability: str | None = None
     created_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
@@ -60,6 +105,72 @@ class MetricValue:
     display_label: str
     plain_explanation: str
     expert_explanation: str | None = None
+    collected_at: float = field(default_factory=time.time)
+    source_name: str = ""
+    capability: str = ""
+    formula: str | None = None
+    caveat: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class ProviderCapability:
+    name: str
+    support: CapabilitySupport
+    granularity: str
+    limitation: str | None = None
+    status_when_present: MetricStatus | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class ProviderCapabilityRecord:
+    provider_id: str
+    provider_name: str
+    mode: str
+    capabilities: dict[str, ProviderCapability]
+    steering_methods: list[str] = field(default_factory=list)
+    generated_at: float = field(default_factory=time.time)
+
+    def __post_init__(self) -> None:
+        missing = set(CAPABILITY_NAMES) - set(self.capabilities)
+        if missing:
+            raise ValueError(f"capability record is missing: {', '.join(sorted(missing))}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "provider_id": self.provider_id,
+            "provider_name": self.provider_name,
+            "mode": self.mode,
+            "generated_at": self.generated_at,
+            "steering_methods": list(self.steering_methods),
+            "capabilities": {
+                name: capability.to_dict()
+                for name, capability in self.capabilities.items()
+            },
+        }
+
+
+@dataclass(slots=True)
+class TelemetryEvent:
+    event_type: TelemetryEventType
+    session_id: str
+    run_id: str
+    status: MetricStatus
+    source_name: str
+    capability: str
+    payload: dict[str, Any]
+    sequence: int = 0
+    token_id: int | None = None
+    layer_index: int | None = None
+    evidence_ids: list[str] = field(default_factory=list)
+    event_id: str = field(default_factory=lambda: evidence_id("evt"))
+    collected_at: float = field(default_factory=time.time)
+    schema_version: str = TELEMETRY_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -160,6 +271,7 @@ def make_evidence(
     source_field: str | None = None,
     formula: str | None = None,
     caveat: str | None = None,
+    capability: str | None = None,
 ) -> EvidenceRecord:
     return EvidenceRecord(
         evidence_id=evidence_id(),
@@ -168,6 +280,30 @@ def make_evidence(
         source_field=source_field,
         formula=formula,
         caveat=caveat,
+        capability=capability,
+    )
+
+
+def make_unavailable_metric(
+    *,
+    name: str,
+    display_label: str,
+    evidence: EvidenceRecord,
+    capability: str,
+    explanation: str,
+) -> MetricValue:
+    return MetricValue(
+        name=name,
+        value=None,
+        unit=None,
+        status="unavailable",
+        evidence_id=evidence.evidence_id,
+        display_label=display_label,
+        plain_explanation=explanation,
+        expert_explanation=evidence.caveat,
+        source_name=evidence.source_name,
+        capability=capability,
+        caveat=evidence.caveat,
     )
 
 

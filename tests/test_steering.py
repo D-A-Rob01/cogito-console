@@ -13,7 +13,7 @@ from cogito_console.metrics import MetricEngine
 from cogito_console.persistence import PersistenceStore
 from cogito_console.providers import LocalDemoAdapter, OpenAIAdapter, ProviderUnavailableError
 from cogito_console.router import ConfluenceRouter
-from cogito_console.schemas import MetricValue
+from cogito_console.schemas import CAPABILITY_NAMES, MetricValue, TelemetryEvent
 from cogito_console.transaction_log import TokenTransactionLog, normalize_splice_token
 
 
@@ -150,9 +150,11 @@ async def test_local_demo_packets_label_all_synthetic_metrics():
     assert packet["hidden_state_metrics"]
 
     for metric in _collect_metric_dicts(packet):
-        assert metric["status"] in {"real", "derived", "synthetic"}
+        assert metric["status"] in {"real", "derived", "synthetic", "unavailable"}
         assert metric["evidence_id"]
         assert metric["plain_explanation"]
+        assert metric["source_name"]
+        assert metric["capability"]
 
 
 @pytest.mark.anyio
@@ -211,6 +213,41 @@ def test_sqlite_persistence_roundtrip(tmp_path):
     assert store.get_events("session-a")["tokens"][0]["payload"]["token"] == "Cogito "
     assert store.get_evidence("ev-a")["payload"]["source_kind"] == "synthetic"
     assert store.get_metrics("session-a")[0]["payload"]["plain_explanation"] == "demo value"
+
+
+def test_provider_capability_handshake_is_complete():
+    demo = LocalDemoAdapter(LatentBeamInterceptor(token_delay=0)).capability_record()
+    openai = OpenAIAdapter(api_key="").capability_record()
+
+    assert set(demo.capabilities) == set(CAPABILITY_NAMES)
+    assert set(openai.capabilities) == set(CAPABILITY_NAMES)
+    assert demo.capabilities["selected_token_logprobs"].support == "unsupported"
+    assert demo.capabilities["streaming"].status_when_present == "synthetic"
+    assert openai.capabilities["hidden_states"].support == "unsupported"
+    assert openai.capabilities["selected_token_logprobs"].support == "conditional"
+
+
+def test_telemetry_schema_persists_and_exports_jsonl(tmp_path):
+    store = PersistenceStore(tmp_path / "telemetry.sqlite")
+    event = TelemetryEvent(
+        event_type="measurement.unavailable",
+        session_id="session-a",
+        run_id="run-a",
+        status="unavailable",
+        source_name="test provider",
+        capability="hidden_states",
+        payload={"reason": "not exposed"},
+        sequence=3,
+        evidence_ids=["ev-a"],
+    )
+
+    store.save_telemetry_events([event])
+
+    rows = store.get_telemetry_events("session-a")
+    assert store.get_schema_versions() == [1]
+    assert rows[0]["event_type"] == "measurement.unavailable"
+    assert rows[0]["payload"]["schema_version"] == "1.0"
+    assert '"capability": "hidden_states"' in store.export_telemetry_jsonl("session-a")
 
 
 @pytest.mark.anyio
