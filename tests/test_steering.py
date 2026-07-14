@@ -259,6 +259,15 @@ async def test_reference_adapter_emits_real_and_derived_instrumentation():
 
     assert packet["token_event"]["logprob"]["status"] == "real"
     assert packet["token_event"]["probability"]["status"] == "derived"
+    assert packet["metrics"]["token_probability"]["value"] == pytest.approx(
+        0.818730753
+    )
+    assert packet["alternatives"][0]["metrics"]["probability"]["value"] == pytest.approx(
+        0.449328964
+    )
+    assert packet["metrics"]["alternative_1_probability"]["value"] == pytest.approx(
+        0.449328964
+    )
     assert packet["metrics"]["token_entropy_bits"]["status"] == "derived"
     assert packet["metrics"]["tokenizer_token_id"]["value"] == 17
     assert packet["hidden_state_metrics"]["layer_1_delta_l2"]["value"] == 0.6

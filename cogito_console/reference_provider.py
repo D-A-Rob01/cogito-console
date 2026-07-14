@@ -957,6 +957,7 @@ class TransformersReferenceAdapter(ProviderAdapter):
             probability = MetricEngine.token_probability(
                 logprob, probability_evidence.evidence_id
             )
+            probability.name = f"alternative_{rank}_probability"
             metrics.append(probability)
             margin_evidence = _evidence(
                 evidence,
@@ -969,6 +970,7 @@ class TransformersReferenceAdapter(ProviderAdapter):
             alternative_margin = MetricEngine.alternative_margin(
                 selected_logprob, logprob, margin_evidence.evidence_id
             )
+            alternative_margin.name = f"alternative_{rank}_margin"
             metrics.append(alternative_margin)
             result.append(
                 AlternativeTokenEvent(
