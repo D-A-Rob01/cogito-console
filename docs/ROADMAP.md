@@ -21,7 +21,7 @@ Updated: 2026-07-13
 - [x] Add a quick reproducible evaluation/experiment fixture.
 - [x] Run automated, API, websocket, and browser QA.
 - [x] Add screenshots and a recorded experiment.
-- [ ] Publish focused commits and a draft pull request.
+- [x] Publish focused commits and a draft pull request ([#1](https://github.com/D-A-Rob01/cogito-console/pull/1)).
 
 ## v0.4 - Routed Thought
 
