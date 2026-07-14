@@ -12,6 +12,7 @@ from cogito_console.memory import EpigeneticMemoryController
 from cogito_console.metrics import MetricEngine
 from cogito_console.persistence import PersistenceStore
 from cogito_console.providers import LocalDemoAdapter, OpenAIAdapter, ProviderUnavailableError
+from cogito_console.purge import purge_local_data
 from cogito_console.reference_provider import (
     GenerationSettings,
     LayerSummary,
@@ -22,6 +23,7 @@ from cogito_console.reference_provider import (
 )
 from cogito_console.router import ConfluenceRouter
 from cogito_console.schemas import CAPABILITY_NAMES, MetricValue, TelemetryEvent
+from cogito_console.server import RuntimeSession, _capability_events
 from cogito_console.transaction_log import TokenTransactionLog, normalize_splice_token
 
 
@@ -327,6 +329,25 @@ def test_provider_capability_handshake_is_complete():
     assert openai.capabilities["selected_token_logprobs"].support == "conditional"
 
 
+def test_conditionally_disabled_measurements_are_explicitly_unavailable():
+    adapter = TransformersReferenceAdapter()
+    session = RuntimeSession(session_id="capability-session", run_id="capability-run")
+
+    events, _, metrics = _capability_events(
+        session, adapter.capability_record().to_dict()
+    )
+
+    unavailable_capabilities = {
+        event.capability
+        for event in events
+        if event.event_type == "measurement.unavailable"
+    }
+    unavailable_metric_names = {metric.name for metric in metrics}
+    assert "attentions" in unavailable_capabilities
+    assert "kv_cache_metrics" in unavailable_capabilities
+    assert "attentions_availability" in unavailable_metric_names
+
+
 def test_telemetry_schema_persists_and_exports_jsonl(tmp_path):
     store = PersistenceStore(tmp_path / "telemetry.sqlite")
     event = TelemetryEvent(
@@ -348,6 +369,29 @@ def test_telemetry_schema_persists_and_exports_jsonl(tmp_path):
     assert rows[0]["event_type"] == "measurement.unavailable"
     assert rows[0]["payload"]["schema_version"] == "1.0"
     assert '"capability": "hidden_states"' in store.export_telemetry_jsonl("session-a")
+
+
+def test_local_data_purge_is_bounded_and_reports_exact_files(tmp_path):
+    data_file = tmp_path / "data" / "cogito.sqlite"
+    trace_file = tmp_path / "traces" / "run.jsonl"
+    outside_file = tmp_path / "README.md"
+    data_file.parent.mkdir()
+    trace_file.parent.mkdir()
+    data_file.write_bytes(b"database")
+    trace_file.write_bytes(b"trace")
+    outside_file.write_text("preserve", encoding="utf-8")
+
+    preview = purge_local_data(root=tmp_path, dry_run=True)
+    removed = purge_local_data(root=tmp_path)
+
+    assert [(item.path, item.bytes) for item in preview] == [
+        ("data/cogito.sqlite", 8),
+        ("traces/run.jsonl", 5),
+    ]
+    assert removed == preview
+    assert not data_file.exists()
+    assert not trace_file.exists()
+    assert outside_file.read_text(encoding="utf-8") == "preserve"
 
 
 @pytest.mark.anyio

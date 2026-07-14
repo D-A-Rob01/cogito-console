@@ -3,92 +3,153 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Cogito Console</title>
+    <meta name="theme-color" content="#070a0f" />
+    <title>Cogito Console · Measured Inference</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=0.3.2" />
   </head>
   <body>
-    <main class="app-shell">
-      <aside class="side-panel">
-        <div class="brand-row">
-          <span class="brand-mark"></span>
-          <div>
-            <h1>Cogito Console</h1>
-            <p>Local AI observability and steering console</p>
-          </div>
-        </div>
+    <header class="topbar">
+      <div class="wordmark" aria-label="Cogito Console">
+        <span class="brand-sigil" aria-hidden="true"></span>
+        <div><strong>COGITO</strong><span>CONSOLE</span></div>
+      </div>
+      <div class="mission-line">
+        <span class="live-dot"></span>
+        <span>v0.3</span>
+        <strong>MEASURED INFERENCE</strong>
+        <span id="socketState">connecting</span>
+      </div>
+      <label class="mode-switch">
+        <span>Plain</span>
+        <input id="expertToggle" type="checkbox" />
+        <i></i>
+        <span>Expert</span>
+      </label>
+    </header>
 
-        <label class="field-label" for="promptInput">Prompt</label>
-        <textarea id="promptInput" spellcheck="false">Build a middleware architecture that exposes sub-perceptual nerves, streams logprob alternatives, and lets the operator rewrite model history mid-stream.</textarea>
-
-        <div class="button-row">
-          <button id="startButton" class="primary">Start</button>
-          <button id="evaporateButton">Clear run</button>
-        </div>
-
-        <label class="toggle-row">
-          <input id="expertToggle" type="checkbox" />
-          <span>Expert mode</span>
-        </label>
-
-        <section class="status-stack">
-          <div>
-            <span>Session</span>
-            <strong id="sessionId">pending</strong>
-          </div>
-          <div>
-            <span>Socket</span>
-            <strong id="socketState">connecting</strong>
-          </div>
-          <div>
-            <span>Mesh</span>
-            <strong id="meshState">idle</strong>
-          </div>
-          <div>
-            <span>Provider</span>
-            <strong id="providerState">checking</strong>
-          </div>
+    <main class="console-shell">
+      <aside class="control-rail">
+        <section class="rail-section">
+          <div class="eyebrow">Experiment input</div>
+          <label for="promptInput">Prompt</label>
+          <textarea id="promptInput" spellcheck="false">Name one practical benefit of measuring real token probabilities.</textarea>
         </section>
+
+        <section class="rail-section">
+          <label for="providerSelect">Inference backend</label>
+          <select id="providerSelect"><option>Loading providers…</option></select>
+          <div id="providerAvailability" class="availability">Checking local runtime</div>
+          <div id="modelCard" class="model-card"></div>
+        </section>
+
+        <details class="rail-section settings" open>
+          <summary>Generation settings</summary>
+          <div class="settings-grid">
+            <label>New tokens<input id="maxTokens" type="number" min="1" max="128" value="16" /></label>
+            <label>Top alternatives<input id="topAlternatives" type="number" min="1" max="10" value="5" /></label>
+            <label>Temperature<input id="temperature" type="number" min="0.01" max="4" step="0.01" value="0.7" /></label>
+            <label>Top-k<input id="topK" type="number" min="0" max="500" value="40" /></label>
+            <label>Top-p<input id="topP" type="number" min="0.01" max="1" step="0.01" value="0.95" /></label>
+            <label>Seed<input id="seed" type="number" value="42" /></label>
+          </div>
+          <label class="check-row"><input id="doSample" type="checkbox" /> Sample instead of greedy</label>
+        </details>
+
+        <div class="action-row">
+          <button id="startButton" class="primary" disabled><span>▶</span> Run experiment</button>
+          <button id="evaporateButton" class="icon-button" title="Clear run" aria-label="Clear run">×</button>
+        </div>
+
+        <section class="rail-section session-card">
+          <div><span>Session</span><code id="sessionId">pending</code></div>
+          <div><span>Run</span><code id="runId">not started</code></div>
+          <div><span>Persistence</span><strong id="persistenceState">local</strong></div>
+        </section>
+
+        <div class="truth-legend" aria-label="Evidence status legend">
+          <span class="status real">REAL</span>
+          <span class="status derived">DERIVED</span>
+          <span class="status synthetic">SYNTHETIC</span>
+          <span class="status unavailable">UNAVAILABLE</span>
+        </div>
       </aside>
 
-      <section class="graph-stage">
-        <header class="stage-header">
-          <div>
-            <h2>Live Graph</h2>
-            <p>Prompt checks -> Live path -> Session context</p>
-          </div>
-          <div class="stream-metrics">
-            <span><b id="tokenCount">0</b> tokens</span>
-            <span><b id="rewriteCount">0</b> rewrites</span>
-          </div>
-        </header>
+      <section class="workspace">
+        <div id="truthBanner" class="truth-banner synthetic">
+          <strong>DEMO DATA</strong>
+          <span>Choose the Transformers backend to measure a real local model.</span>
+        </div>
 
-        <div id="graphCanvas" class="graph-canvas" aria-label="Live Cogito graph"></div>
-
-        <section class="transcript-panel">
-          <div class="panel-title">Token stream</div>
-          <div id="tokenStream" class="token-stream" aria-live="polite"></div>
+        <section id="runStrip" class="run-strip" aria-label="Run identity and measurements">
+          <div><span>Model revision</span><strong id="modelRevision">—</strong></div>
+          <div><span>Tokenizer revision</span><strong id="tokenizerRevision">—</strong></div>
+          <div><span>Prompt</span><strong id="promptTokens">— tokens</strong></div>
+          <div><span>TTFT</span><strong id="ttft">—</strong></div>
+          <div><span>Throughput</span><strong id="throughput">—</strong></div>
+          <div><span>Process RAM</span><strong id="processRam">—</strong></div>
+          <div><span>CPU</span><strong id="cpuUse">—</strong></div>
+          <div><span>Fingerprint</span><strong id="fingerprint">—</strong></div>
         </section>
 
-        <section class="event-panel">
-          <div class="panel-title">Event timeline</div>
-          <ol id="eventLog"></ol>
-          <div id="comparePanel" class="compare-panel empty">Change a path to compare branches.</div>
+        <section class="panel token-panel">
+          <header class="panel-header">
+            <div><span class="panel-index">01</span><h2>Token lane</h2></div>
+            <div class="panel-meta"><span id="tokenCount">0 tokens</span><span id="streamState">idle</span></div>
+          </header>
+          <div class="table-scroll">
+            <table class="token-table">
+              <thead><tr><th>#</th><th>Token</th><th>Truth</th><th>Logprob</th><th>Probability</th><th>Entropy</th><th>Top margin</th><th>Latency</th></tr></thead>
+              <tbody id="tokenLaneBody"><tr class="empty-row"><td colspan="8">Run an experiment to populate measured token decisions.</td></tr></tbody>
+            </table>
+          </div>
+          <div id="transcript" class="transcript">Awaiting a measured continuation.</div>
+        </section>
+
+        <section class="mechanics-grid">
+          <article class="panel mechanics-panel">
+            <header class="panel-header"><div><span class="panel-index">02</span><h2>Model mechanics</h2></div><span id="mechanicsToken">select a token</span></header>
+            <div id="layerChart" class="layer-chart empty-state">Layer summaries appear here only when the backend exposes hidden states.</div>
+          </article>
+          <article class="panel causal-panel">
+            <header class="panel-header"><div><span class="panel-index">03</span><h2>Measured path</h2></div></header>
+            <div id="causalPath" class="causal-path empty-state">Prompt → prefill → token decisions</div>
+            <div id="resourceSamples" class="resource-samples"></div>
+          </article>
+        </section>
+
+        <section class="lower-grid">
+          <article class="panel capability-panel">
+            <header class="panel-header"><div><span class="panel-index">04</span><h2>Capability matrix</h2></div><span>backend declaration</span></header>
+            <div id="capabilityMatrix" class="capability-matrix"></div>
+          </article>
+          <article class="panel intervention-panel">
+            <header class="panel-header"><div><span class="panel-index">05</span><h2>Intervention ledger</h2></div><span id="rewriteCount">0 changes</span></header>
+            <div id="interventionLedger" class="ledger empty-state">Selecting an alternate token records the old run, new run, invalidated suffix, and replay method.</div>
+          </article>
         </section>
       </section>
 
-      <aside class="inspector">
-        <div class="panel-title">Inspector</div>
-        <div id="selectedToken" class="selected-token empty">Click a number, token, or branch to inspect where it came from.</div>
+      <aside class="evidence-rail">
+        <div class="eyebrow">Cross-examination</div>
+        <h2>Evidence inspector</h2>
+        <div id="selectedMetric" class="selected-metric empty-state">Select any displayed number to ask where it came from.</div>
 
-        <div class="panel-title">Alternatives</div>
-        <div id="alternatives" class="alternatives"></div>
+        <section class="evidence-section">
+          <h3>Alternative tokens</h3>
+          <p class="section-help">Choosing one creates a recorded branch replay where supported.</p>
+          <div id="alternatives" class="alternatives empty-state">No token selected.</div>
+        </section>
 
-        <div class="panel-title">Signal panel</div>
-        <div id="hiddenState" class="hidden-state"></div>
+        <section class="evidence-section expert-only">
+          <h3>Event trace</h3>
+          <ol id="eventLog" class="event-log"></ol>
+        </section>
+
+        <a id="exportLink" class="export-link disabled" href="#" aria-disabled="true">Export telemetry JSONL ↗</a>
       </aside>
     </main>
 
-    <script src="/static/app.js" type="module"></script>
+    <script src="/static/app.js?v=0.3.2" type="module"></script>
   </body>
 </html>

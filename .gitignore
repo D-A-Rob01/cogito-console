@@ -1,5 +1,6 @@
 # Python and test environments
 .venv/
+*.egg-info/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -29,6 +30,7 @@ pytorch_model*.bin
 tokenizer.model
 
 # Local QA output
+.qa/
 screenshots/
 playwright-report/
 test-results/

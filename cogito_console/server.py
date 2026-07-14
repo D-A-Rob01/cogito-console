@@ -700,7 +700,11 @@ def _capability_events(
     evidence: list[EvidenceRecord] = []
     unavailable: list[MetricValue] = []
     for capability_name, descriptor in capability_record["capabilities"].items():
-        if descriptor["support"] != "unsupported":
+        explicitly_unavailable = descriptor["support"] == "unsupported" or (
+            descriptor["support"] == "conditional"
+            and descriptor.get("status_when_present") == "unavailable"
+        )
+        if not explicitly_unavailable:
             continue
         record = make_evidence(
             "provider",
