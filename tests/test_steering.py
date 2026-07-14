@@ -12,6 +12,14 @@ from cogito_console.memory import EpigeneticMemoryController
 from cogito_console.metrics import MetricEngine
 from cogito_console.persistence import PersistenceStore
 from cogito_console.providers import LocalDemoAdapter, OpenAIAdapter, ProviderUnavailableError
+from cogito_console.reference_provider import (
+    GenerationSettings,
+    LayerSummary,
+    ModelIdentity,
+    ReferenceAlternative,
+    ReferenceStep,
+    TransformersReferenceAdapter,
+)
 from cogito_console.router import ConfluenceRouter
 from cogito_console.schemas import CAPABILITY_NAMES, MetricValue, TelemetryEvent
 from cogito_console.transaction_log import TokenTransactionLog, normalize_splice_token
@@ -172,6 +180,98 @@ async def test_openai_adapter_missing_key_fails_gracefully():
             run_id="run-a",
         )
         await stream.__anext__()
+
+
+@pytest.mark.anyio
+async def test_reference_adapter_emits_real_and_derived_instrumentation():
+    identity = ModelIdentity(
+        registry_key="fixture",
+        model_id="fixture/tiny-causal-lm",
+        requested_revision="fixture-revision",
+        model_revision="fixture-model-commit",
+        tokenizer_revision="fixture-tokenizer-commit",
+        parameter_count=64,
+        license="apache-2.0",
+        dtype="float32",
+        quantization="none",
+        device="cpu",
+    )
+    settings = GenerationSettings(max_input_tokens=32, max_new_tokens=1)
+    step = ReferenceStep(
+        position=0,
+        tokenizer_token_id=17,
+        text=" measured",
+        selected_logprob=-0.2,
+        selected_probability=0.818730753,
+        sampling_probability=1.0,
+        entropy_bits=1.75,
+        top1_top2_margin=0.41,
+        alternatives=[
+            ReferenceAlternative(
+                token_id=18,
+                text=" observed",
+                logprob=-0.8,
+                probability=0.449328964,
+            )
+        ],
+        layer_summaries=[
+            LayerSummary(layer_index=0, l2_norm=2.0, delta_l2=None),
+            LayerSummary(layer_index=1, l2_norm=2.4, delta_l2=0.6),
+        ],
+        resource_sample={
+            "process_rss_bytes": 1024,
+            "process_cpu_percent": 12.5,
+            "system_cpu_percent": 25.0,
+            "system_memory_used_bytes": 2048,
+            "system_memory_percent": 50.0,
+        },
+        latency_ms=14.0,
+        time_to_first_token_ms=22.0,
+        prefill_ms=8.0,
+        cold_load_ms=3.0,
+        prompt_tokens=11,
+        raw_logit_summary={"minimum": -3.0, "maximum": 2.0, "mean": -0.1},
+        model_identity=identity,
+        generation_settings=settings,
+        run_fingerprint="fixture-fingerprint",
+    )
+
+    class FixtureRuntime:
+        def generate(self, prompt, system_context, history, runtime_settings):
+            assert prompt == "measure this"
+            assert runtime_settings == settings
+            yield step
+
+    adapter = TransformersReferenceAdapter(settings=settings, runtime=FixtureRuntime())
+    provider_packet = await adapter.stream(
+        "measure this",
+        "system",
+        [],
+        session_id="reference-session",
+        run_id="reference-run",
+    ).__anext__()
+    packet = provider_packet.to_legacy_packet(adapter.name)
+    event_types = {
+        event["event_type"] for event in packet["telemetry_events"]
+    }
+
+    assert packet["token_event"]["logprob"]["status"] == "real"
+    assert packet["token_event"]["probability"]["status"] == "derived"
+    assert packet["metrics"]["token_entropy_bits"]["status"] == "derived"
+    assert packet["metrics"]["tokenizer_token_id"]["value"] == 17
+    assert packet["hidden_state_metrics"]["layer_1_delta_l2"]["value"] == 0.6
+    assert packet["raw_provider_payload"]["run_fingerprint"] == "fixture-fingerprint"
+    assert {
+        "prompt.encoded",
+        "prefill.completed",
+        "token.sampled",
+        "token.committed",
+        "layer.summary",
+        "resource.sample",
+    } <= event_types
+    for metric in _collect_metric_dicts(packet):
+        assert metric["source_name"]
+        assert metric["capability"]
 
 
 def test_sqlite_persistence_roundtrip(tmp_path):

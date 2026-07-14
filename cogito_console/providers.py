@@ -88,9 +88,6 @@ class ProviderStreamPacket:
                 metric.source_name = metric.source_name or provider_name
                 metric.capability = metric.capability or _metric_capability(metric.name)
 
-        if self.telemetry_events:
-            return self.telemetry_events
-
         token_event = self.token_event
         token_status = token_event.logprob.status if token_event.logprob else "real"
         evidence_ids = [metric.evidence_id for metric in self._all_metrics()]
@@ -102,8 +99,10 @@ class ProviderStreamPacket:
             "latency_ms": metric_dict(token_event.latency_ms),
             "alternative_count": len(token_event.alternatives),
         }
-        self.telemetry_events.extend(
-            [
+        existing_types = {event.event_type for event in self.telemetry_events}
+        generated_events = [
+            event
+            for event in [
                 TelemetryEvent(
                     event_type="token.sampled",
                     session_id=token_event.session_id,
@@ -127,9 +126,20 @@ class ProviderStreamPacket:
                     evidence_ids=evidence_ids,
                 ),
             ]
-        )
+            if event.event_type not in existing_types
+        ]
+        self.telemetry_events.extend(generated_events)
+        unavailable_evidence_ids = {
+            evidence_id
+            for event in self.telemetry_events
+            if event.event_type == "measurement.unavailable"
+            for evidence_id in event.evidence_ids
+        }
         for metric in self._all_metrics():
-            if metric.status == "unavailable":
+            if (
+                metric.status == "unavailable"
+                and metric.evidence_id not in unavailable_evidence_ids
+            ):
                 self.telemetry_events.append(
                     TelemetryEvent(
                         event_type="measurement.unavailable",
@@ -196,6 +206,7 @@ class ProviderAdapter(ABC):
         *,
         session_id: str,
         run_id: str,
+        generation_settings: dict[str, Any] | None = None,
     ) -> AsyncIterator[ProviderStreamPacket]:
         ...
 
@@ -274,6 +285,7 @@ class LocalDemoAdapter(ProviderAdapter):
         *,
         session_id: str,
         run_id: str,
+        generation_settings: dict[str, Any] | None = None,
     ) -> AsyncIterator[ProviderStreamPacket]:
         source = self.interceptor.stream_with_steering_hooks(
             prompt=prompt,
@@ -552,6 +564,7 @@ class OpenAIAdapter(ProviderAdapter):
         *,
         session_id: str,
         run_id: str,
+        generation_settings: dict[str, Any] | None = None,
     ) -> AsyncIterator[ProviderStreamPacket]:
         if not self.api_key:
             raise ProviderUnavailableError("OpenAI adapter unavailable: missing OPENAI_API_KEY.")
@@ -762,6 +775,10 @@ def adapter_from_env(interceptor: LatentBeamInterceptor | None = None) -> Provid
     provider = os.getenv("COGITO_PROVIDER", "demo").strip().lower()
     if provider == "openai":
         return OpenAIAdapter()
+    if provider in {"transformers", "reference", "local"}:
+        from .reference_provider import TransformersReferenceAdapter
+
+        return TransformersReferenceAdapter()
     enable_synthetic_probes = os.getenv("COGITO_ENABLE_SYNTHETIC_PROBES", "true").lower() != "false"
     return LocalDemoAdapter(interceptor=interceptor, enable_synthetic_probes=enable_synthetic_probes)
 

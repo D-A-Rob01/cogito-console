@@ -231,6 +231,13 @@ class RewriteEvent:
     operator_action_timestamp: float
     reason: str | None = None
     rationale: str | None = None
+    intervention_type: str = "narrative_ui_splice"
+    provider_id: str | None = None
+    capability: str = "branch_replay"
+    status: MetricStatus = "synthetic"
+    reused_prefix_tokens: int = 0
+    invalidated_token_count: int = 0
+    recomputed_from_token: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
