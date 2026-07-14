@@ -7,20 +7,20 @@ Updated: 2026-07-13
 - [x] Preserve the standing mission in `CODEX_MISSION.md`.
 - [x] Audit tests, provider flow, evidence/metrics, graph, persistence, websocket steering, and UI.
 - [x] Record the current architecture and initial decisions.
-- [ ] Add first-class provider capabilities and `UNAVAILABLE` measurements.
-- [ ] Add the versioned normalized telemetry envelope and SQLite migration.
-- [ ] Add JSONL trace export and bounded local data purge.
-- [ ] Add a lazy reference local provider with registry-selected model identity.
-- [ ] Emit real token IDs, logits-derived logprob/top-k/probability/entropy/margin.
-- [ ] Emit real prefill, time-to-first-token, per-token latency, RAM, and CPU telemetry.
-- [ ] Emit real per-layer last-token hidden-state summaries.
-- [ ] Record exact generation settings, revisions, environment, and fingerprint.
-- [ ] Make capabilities and unavailable signals visible before a run.
-- [ ] Align token lane, mechanics lane, evidence inspector, and replay ledger.
-- [ ] Distinguish true branch replay from synthetic narrative splice.
-- [ ] Add a quick reproducible evaluation/experiment fixture.
-- [ ] Run automated, API, websocket, and browser QA.
-- [ ] Add screenshots and a recorded experiment.
+- [x] Add first-class provider capabilities and `UNAVAILABLE` measurements.
+- [x] Add the versioned normalized telemetry envelope and SQLite migration.
+- [x] Add JSONL trace export and bounded local data purge.
+- [x] Add a lazy reference local provider with registry-selected model identity.
+- [x] Emit real token IDs, logits-derived logprob/top-k/probability/entropy/margin.
+- [x] Emit real prefill, time-to-first-token, per-token latency, RAM, and CPU telemetry.
+- [x] Emit real per-layer last-token hidden-state summaries.
+- [x] Record exact generation settings, revisions, environment, and fingerprint.
+- [x] Make capabilities and unavailable signals visible before a run.
+- [x] Align token lane, mechanics lane, evidence inspector, and replay ledger.
+- [x] Distinguish true branch replay from synthetic narrative splice.
+- [x] Add a quick reproducible evaluation/experiment fixture.
+- [x] Run automated, API, websocket, and browser QA.
+- [x] Add screenshots and a recorded experiment.
 - [ ] Publish focused commits and a draft pull request.
 
 ## v0.4 - Routed Thought

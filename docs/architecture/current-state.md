@@ -1,4 +1,4 @@
-# Cogito Console current state
+# Cogito Console baseline audit and v0.3 state
 
 Audit date: 2026-07-13
 Baseline commit: `18c9b82`
@@ -6,7 +6,7 @@ Baseline tests: `12 passed`
 
 ## Runtime shape
 
-Cogito Console 0.2 is a FastAPI application with a static HTML/CSS/JavaScript client. A websocket session owns a `RuntimeSession`, a provider stream, a transaction log, an in-memory temporary context mesh, graph projections, and persistence calls.
+At the audited baseline, Cogito Console 0.2 was a FastAPI application with a static HTML/CSS/JavaScript client. A websocket session owned a `RuntimeSession`, a provider stream, a transaction log, an in-memory temporary context mesh, graph projections, and persistence calls.
 
 ```text
 browser
@@ -92,3 +92,11 @@ The v0.3 implementation will:
 7. retain deterministic demo mode as an unmistakably synthetic test surface.
 
 llama.cpp, small-MoE routing, and Colibri remain follow-on milestones after the first complete measured-inference slice.
+
+## Implemented v0.3 state
+
+The measured-inference slice now adds a per-session provider selection, a complete capability handshake, explicit unavailable measurements, normalized schema-versioned telemetry, bounded SQLite/JSONL persistence, and a local purge command. The lazy Transformers reference adapter manually decodes a registry-selected SmolLM2 checkpoint and emits real token IDs, logprobs, top alternatives, prefill/decode timing, and resource samples. Probability, entropy, top-choice margin, and layer L2 summaries remain explicitly derived from real tensors.
+
+The browser now reads in this order: reproducible run strip, token lane, model mechanics, measured path, capability matrix, intervention ledger, and evidence inspector. A selected alternative is recorded as a true branch replay only for a provider that declares and performs replay; demo mode remains a synthetic narrative splice.
+
+The recorded local experiment is in `docs/experiments/v0.3-smollm2-measured-inference.md`. The accepted visual concept and browser-verification screenshots are retained in the Codex task's visualization artifacts rather than the repository.

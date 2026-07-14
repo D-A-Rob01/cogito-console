@@ -17,7 +17,7 @@ Reasons:
 - native Transformers causal-LM support;
 - small enough for conservative CPU-first loading and repeated instrumented forward passes;
 - hidden states and raw logits are available through the standard model output;
-- the checkpoint is replaceable through `COGITO_MODEL` and registry entries.
+- the checkpoint is replaceable through `COGITO_LOCAL_MODEL` and registry entries.
 
 Default guardrails:
 
