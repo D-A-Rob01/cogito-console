@@ -1,6 +1,6 @@
 [project]
 name = "cogito-console"
-version = "0.2.0"
+version = "0.3.0"
 description = "Cogito Console: auditable local AI steering and inference-event visualization."
 requires-python = ">=3.11"
 dependencies = [
@@ -13,6 +13,15 @@ dev = [
   "pytest>=9.1.0",
   "websockets>=16.0",
 ]
+
+local = [
+  "psutil>=6.1.0",
+  "torch>=2.6.0",
+  "transformers>=4.48.0,<6",
+]
+
+[project.scripts]
+cogito-purge = "cogito_console.purge:main"
 
 [tool.setuptools.packages.find]
 include = ["cogito_console"]

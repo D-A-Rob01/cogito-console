@@ -1,733 +1,422 @@
+const $ = (selector) => document.querySelector(selector);
+
 const els = {
-  prompt: document.querySelector("#promptInput"),
-  start: document.querySelector("#startButton"),
-  evaporate: document.querySelector("#evaporateButton"),
-  sessionId: document.querySelector("#sessionId"),
-  socketState: document.querySelector("#socketState"),
-  meshState: document.querySelector("#meshState"),
-  providerState: document.querySelector("#providerState"),
-  expertToggle: document.querySelector("#expertToggle"),
-  tokenCount: document.querySelector("#tokenCount"),
-  rewriteCount: document.querySelector("#rewriteCount"),
-  graphCanvas: document.querySelector("#graphCanvas"),
-  tokenStream: document.querySelector("#tokenStream"),
-  eventLog: document.querySelector("#eventLog"),
-  selectedToken: document.querySelector("#selectedToken"),
-  alternatives: document.querySelector("#alternatives"),
-  hiddenState: document.querySelector("#hiddenState"),
-  comparePanel: document.querySelector("#comparePanel"),
+  prompt: $("#promptInput"), provider: $("#providerSelect"), providerAvailability: $("#providerAvailability"),
+  modelCard: $("#modelCard"), start: $("#startButton"), evaporate: $("#evaporateButton"),
+  expert: $("#expertToggle"), socket: $("#socketState"), session: $("#sessionId"), run: $("#runId"),
+  truthBanner: $("#truthBanner"), maxTokens: $("#maxTokens"), topAlternatives: $("#topAlternatives"),
+  temperature: $("#temperature"), topK: $("#topK"), topP: $("#topP"), seed: $("#seed"),
+  doSample: $("#doSample"), tokenBody: $("#tokenLaneBody"), tokenCount: $("#tokenCount"),
+  streamState: $("#streamState"), transcript: $("#transcript"), layerChart: $("#layerChart"),
+  mechanicsToken: $("#mechanicsToken"), causalPath: $("#causalPath"), resources: $("#resourceSamples"),
+  capabilityMatrix: $("#capabilityMatrix"), ledger: $("#interventionLedger"), rewriteCount: $("#rewriteCount"),
+  selectedMetric: $("#selectedMetric"), alternatives: $("#alternatives"), events: $("#eventLog"),
+  exportLink: $("#exportLink"), modelRevision: $("#modelRevision"), tokenizerRevision: $("#tokenizerRevision"),
+  promptTokens: $("#promptTokens"), ttft: $("#ttft"), throughput: $("#throughput"),
+  processRam: $("#processRam"), cpuUse: $("#cpuUse"), fingerprint: $("#fingerprint"),
 };
 
 const state = {
-  socket: null,
-  sessionId: crypto.randomUUID(),
-  mesh: null,
-  subContext: null,
-  tokens: [],
-  selectedTokenId: null,
-  visualPaused: false,
-  pausedGraphTokens: null,
-  hoverGhost: null,
-  pendingSteer: null,
-  collapsedBranches: [],
-  originTokenId: null,
-  camera: { x: 50, y: 50, scale: 1 },
-  rewrites: 0,
-  events: [],
-  provider: null,
-  expertMode: false,
-  lastComparison: null,
+  sessionId: crypto.randomUUID(), socket: null, providers: [], provider: null,
+  capabilityRecord: null, tokens: [], selectedTokenId: null, selectedMetricName: "token_logprob",
+  rewrites: [], events: [], runMetrics: {}, streaming: false,
 };
+
+const metricColumns = [
+  ["token_logprob", "logprob"],
+  ["token_probability", "probability"],
+  ["token_entropy_bits", "entropy"],
+  ["top1_top2_probability_margin", "margin"],
+  ["token_latency_ms", "latency"],
+];
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
+}
+
+function short(value, length = 9) {
+  if (!value) return "—";
+  const text = String(value);
+  return text.length > length ? `${text.slice(0, length)}…` : text;
+}
+
+function formatNumber(value, digits = 3) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
+  const number = Number(value);
+  if (number !== 0 && Math.abs(number) < 0.0001) return number.toExponential(2);
+  if (Math.abs(number) >= 1000) return number.toLocaleString(undefined, { maximumFractionDigits: 1 });
+  return String(Number(number.toFixed(digits)));
+}
+
+function formatMetric(metric) {
+  if (!metric || metric.status === "unavailable" || metric.value === null) return "Unavailable";
+  const value = formatNumber(metric.value, metric.name?.includes("probability") ? 4 : 3);
+  if (metric.unit === "ms") return `${value} ms`;
+  if (metric.unit === "bits") return `${value} bits`;
+  if (metric.unit === "bytes") return formatBytes(metric.value);
+  if (metric.unit === "percent") return `${value}%`;
+  return value;
+}
+
+function formatBytes(value) {
+  if (value === null || value === undefined) return "—";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let amount = Number(value); let index = 0;
+  while (amount >= 1024 && index < units.length - 1) { amount /= 1024; index += 1; }
+  return `${amount.toFixed(index > 1 ? 2 : 0)} ${units[index]}`;
+}
+
+function addEvent(label, event = null) {
+  state.events.unshift({ label, event, at: new Date() });
+  state.events = state.events.slice(0, 24);
+  renderEvents();
+}
+
+async function loadProviders() {
+  try {
+    const response = await fetch("/api/providers");
+    if (!response.ok) throw new Error(`provider registry returned ${response.status}`);
+    const payload = await response.json();
+    state.providers = payload.available;
+    els.provider.innerHTML = "";
+    for (const provider of state.providers) {
+      const option = document.createElement("option");
+      option.value = provider.provider_id;
+      option.textContent = `${provider.name}${provider.available ? "" : " · unavailable"}`;
+      option.disabled = !provider.available;
+      els.provider.append(option);
+    }
+    const reference = state.providers.find((provider) => provider.provider_id === "transformers" && provider.available);
+    const active = state.providers.find((provider) => provider.provider_id === payload.active.provider_id && provider.available);
+    els.provider.value = (reference || active || state.providers.find((provider) => provider.available))?.provider_id || "demo";
+    selectProvider();
+  } catch (error) {
+    els.providerAvailability.textContent = `Provider registry unavailable: ${error.message}`;
+    els.providerAvailability.className = "availability bad";
+  }
+}
+
+function selectProvider() {
+  state.provider = state.providers.find((provider) => provider.provider_id === els.provider.value) || null;
+  const provider = state.provider;
+  if (!provider) return;
+  els.start.disabled = !provider.available || state.socket?.readyState !== WebSocket.OPEN;
+  els.providerAvailability.textContent = provider.available ? "Ready for a local run" : provider.unavailable_reason || "Unavailable";
+  els.providerAvailability.className = `availability ${provider.available ? "good" : "bad"}`;
+  const model = provider.model;
+  els.modelCard.innerHTML = model
+    ? `<strong>${escapeHtml(model.model_id)}</strong><span>${formatNumber(model.parameter_count / 1e6, 0)}M parameters · ${escapeHtml(model.license)}</span><span>CPU-first · ${escapeHtml(model.dtype || model.torch_dtype)} · no quantization</span>`
+    : `<strong>${escapeHtml(provider.name)}</strong><span>${provider.provider_id === "demo" ? "Deterministic synthetic fixture" : "Remote provider adapter"}</span>`;
+  if (provider.generation_defaults) applyDefaults(provider.generation_defaults);
+  renderTruthBanner(provider.provider_id === "demo" ? "synthetic" : "real");
+  renderCapabilityMatrix(provider.capability_record);
+}
+
+function applyDefaults(settings) {
+  els.maxTokens.value = Math.min(settings.max_new_tokens || 16, 32);
+  els.topAlternatives.value = settings.top_alternatives || 5;
+  els.temperature.value = settings.temperature || 1;
+  els.topK.value = settings.top_k ?? 0;
+  els.topP.value = settings.top_p ?? 1;
+  els.seed.value = settings.seed ?? 1337;
+  els.doSample.checked = Boolean(settings.do_sample);
+}
 
 function connect() {
   const protocol = location.protocol === "https:" ? "wss" : "ws";
   state.socket = new WebSocket(`${protocol}://${location.host}/ws/cogito/${state.sessionId}`);
-  els.sessionId.textContent = state.sessionId.slice(0, 8);
-
+  els.session.textContent = state.sessionId.slice(0, 8);
   state.socket.addEventListener("open", () => {
-    els.socketState.textContent = "open";
-    addEvent("socket opened");
+    els.socket.textContent = "socket open";
+    els.socket.classList.add("online");
+    els.start.disabled = !state.provider?.available;
+    addEvent("WebSocket opened");
   });
-
   state.socket.addEventListener("close", () => {
-    els.socketState.textContent = "closed";
-    addEvent("socket closed");
+    els.socket.textContent = "socket closed";
+    els.socket.classList.remove("online");
+    els.start.disabled = true;
+    addEvent("WebSocket closed");
   });
-
-  state.socket.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data);
-    receive(message);
-  });
+  state.socket.addEventListener("message", (event) => receive(JSON.parse(event.data)));
 }
 
-function send(message) {
-  if (!state.socket || state.socket.readyState !== WebSocket.OPEN) {
-    addEvent("socket is not open");
-    return;
-  }
-  state.socket.send(JSON.stringify(message));
+function send(payload) {
+  if (state.socket?.readyState !== WebSocket.OPEN) return;
+  state.socket.send(JSON.stringify(payload));
 }
 
-function startStream() {
-  state.tokens = [];
-  state.mesh = null;
-  state.subContext = null;
-  state.selectedTokenId = null;
-  state.visualPaused = false;
-  state.pausedGraphTokens = null;
-  state.hoverGhost = null;
-  state.pendingSteer = null;
-  state.collapsedBranches = [];
-  state.originTokenId = null;
-  state.lastComparison = null;
-  state.camera = { x: 50, y: 50, scale: 1 };
-  els.meshState.textContent = "routing";
-  addEvent("prompt checks started");
+function settings() {
+  return {
+    max_new_tokens: Number(els.maxTokens.value), top_alternatives: Number(els.topAlternatives.value),
+    temperature: Number(els.temperature.value), top_k: Number(els.topK.value), top_p: Number(els.topP.value),
+    seed: Number(els.seed.value), do_sample: els.doSample.checked,
+  };
+}
+
+function startExperiment() {
+  state.tokens = []; state.rewrites = []; state.events = []; state.selectedTokenId = null;
+  state.runMetrics = {}; state.capabilityRecord = null; state.streaming = true;
+  els.streamState.textContent = "starting"; els.run.textContent = "pending";
   renderAll();
-  send({ type: "start", prompt: els.prompt.value });
+  send({ type: "start", prompt: els.prompt.value.trim(), provider_id: els.provider.value, generation_settings: settings() });
+  addEvent(`Experiment requested with ${state.provider?.name || els.provider.value}`);
 }
 
 function receive(message) {
   switch (message.type) {
-    case "session_open":
+    case "session_open": addEvent(`Session ${message.session_id.slice(0, 8)} opened`); break;
+    case "provider_capabilities":
+      state.capabilityRecord = message.capability_record;
       state.provider = message.provider;
-      els.providerState.textContent = providerLabel(message.provider);
-      addEvent(`session ${message.session_id.slice(0, 8)} opened`);
+      renderCapabilityMatrix(message.capability_record);
+      renderTruthBanner(message.provider.provider_id === "demo" ? "synthetic" : "real");
+      appendTelemetry(message.telemetry_events);
       break;
-    case "router_started":
-      els.meshState.textContent = "routing";
-      addEvent("prompt checks running");
-      break;
-    case "router_complete":
-      state.subContext = message.sub_context;
-      addEvent("prompt checks complete");
-      break;
-    case "mesh_manifested":
-      state.mesh = message.mesh;
-      els.meshState.textContent = "active";
-      addEvent("session context manifested");
-      break;
-    case "token":
-      upsertToken(message.packet);
-      break;
-    case "history_rewritten":
-      applyHistoryRewrite(message);
-      break;
-    case "stream_cancelled":
-      addEvent("stream cancelled for steering");
-      break;
-    case "stream_complete":
-      addEvent("stream complete");
-      break;
+    case "router_started": els.streamState.textContent = "encoding"; addEvent("Prompt routing started"); break;
+    case "router_complete": addEvent("Prompt routing recorded"); break;
+    case "mesh_manifested": addEvent("Temporary session context opened"); break;
+    case "token": upsertToken(message.packet); appendTelemetry(message.packet.telemetry_events); break;
+    case "history_rewritten": applyRewrite(message); appendTelemetry(message.telemetry_events); break;
+    case "stream_cancelled": addEvent("Previous continuation cancelled for steering"); break;
+    case "stream_complete": completeRun(message); appendTelemetry(message.telemetry_events); break;
     case "provider_unavailable":
-      els.providerState.textContent = "unavailable";
-      addEvent(message.message || "provider unavailable");
-      break;
-    case "mesh_evaporated":
-      els.meshState.textContent = message.mesh.status;
-      addEvent(`mesh ${message.mesh.status}; released ${message.mesh.released_nodes} nodes`);
-      break;
-    case "error":
-      addEvent(`error: ${message.message}`);
-      break;
-    default:
-      addEvent(`unhandled event ${message.type}`);
+      state.streaming = false; els.streamState.textContent = "unavailable"; addEvent(message.message || "Provider unavailable"); break;
+    case "mesh_evaporated": addEvent("Temporary session context released"); break;
+    case "error": state.streaming = false; els.streamState.textContent = "error"; addEvent(`Error: ${message.message}`); break;
+    default: break;
   }
   renderAll();
+}
+
+function appendTelemetry(events = []) {
+  for (const event of events || []) addEvent(`${event.event_type} · ${String(event.status).toUpperCase()}`, event);
 }
 
 function upsertToken(packet) {
-  const existingIndex = state.tokens.findIndex((token) => token.token_id === packet.token_id);
-  if (existingIndex >= 0) {
-    state.tokens[existingIndex] = { ...packet, rewritten: state.tokens[existingIndex].rewritten };
-  } else {
-    state.tokens.push(packet);
-  }
+  const index = state.tokens.findIndex((token) => token.token_id === packet.token_id);
+  if (index >= 0) state.tokens[index] = packet; else state.tokens.push(packet);
   state.tokens.sort((a, b) => a.token_id - b.token_id);
   state.selectedTokenId = packet.token_id;
+  state.selectedMetricName = "token_logprob";
+  state.streaming = true; els.streamState.textContent = "streaming";
+  els.run.textContent = short(packet.run_id, 8);
+  updateRunIdentity(packet);
 }
 
-function applyHistoryRewrite(message) {
-  state.rewrites += 1;
-  if (state.pendingSteer) {
-    state.collapsedBranches.push({
-      from: state.pendingSteer.tokenId,
-      tokens: state.pendingSteer.oldTokens,
-      origin: state.pendingSteer.origin,
-      createdAt: performance.now(),
-    });
-    state.collapsedBranches = state.collapsedBranches.slice(-3);
-  }
-
-  const nextTokens = message.history.map((token, index) => {
-    const prior = state.tokens.find((item) => item.token_id === index);
-    return {
-      ...(prior || {}),
-      token_id: index,
-      token,
-      alternatives: prior?.alternatives || [],
-      hidden_state: prior?.hidden_state || {},
-      hidden_state_metrics: prior?.hidden_state_metrics || {},
-      metrics: prior?.metrics || {},
-      token_event: prior?.token_event || null,
-      logprob: index === message.token_id ? message.alternative.logprob : prior?.logprob,
-      rewritten: index === message.token_id,
-    };
-  });
-  state.lastComparison = {
-    tokenId: message.token_id,
-    before: message.rewrite_event?.previous_text || state.pendingSteer?.oldTokens?.map((token) => token.token).join("") || "",
-    after: message.rewrite_event?.rewritten_text || message.text,
-    changedToken: message.replacement,
-    oldRunId: message.rewrite_event?.old_run_id,
-    newRunId: message.rewrite_event?.new_run_id || message.run_id,
-    rationale: message.rewrite_event?.rationale || message.alternative?.rationale,
-    alternative: message.alternative,
-  };
-  state.tokens = nextTokens;
-  state.originTokenId = message.token_id;
-  state.selectedTokenId = message.token_id;
-  state.visualPaused = false;
-  state.pausedGraphTokens = null;
-  state.hoverGhost = null;
-  state.pendingSteer = null;
-  addEvent(`Path changed at token ${message.token_id}: ${JSON.stringify(message.replacement.trim())}`);
+function applyRewrite(message) {
+  state.rewrites.push(message.rewrite_event);
+  const replacementIndex = message.token_id;
+  state.tokens = state.tokens.filter((token) => token.token_id <= replacementIndex);
+  const token = state.tokens.find((item) => item.token_id === replacementIndex);
+  if (token) { token.token = message.replacement; token.rewritten = true; token.run_id = message.run_id; }
+  state.selectedTokenId = replacementIndex;
+  els.run.textContent = short(message.run_id, 8);
+  addEvent(`${String(message.rewrite_event?.intervention_type || "intervention").replaceAll("_", " ")} at token ${replacementIndex}`);
 }
 
-function handleAlternativeClick(tokenId, alternative) {
-  queueSteer(tokenId, alternative, getTokenCoordinates(tokenId));
+function completeRun(message) {
+  state.streaming = false; els.streamState.textContent = "complete";
+  state.runMetrics = Object.fromEntries((message.metrics || []).map((metric) => [metric.name, metric]));
+  els.throughput.textContent = state.runMetrics.tokens_per_second ? `${formatNumber(state.runMetrics.tokens_per_second.value, 2)} tok/s` : "—";
+  addEvent("Run completed");
 }
 
-function queueSteer(tokenId, alternative, origin = null) {
-  const oldTokens = state.tokens.filter((token) => token.token_id >= tokenId).map((token) => ({ ...token }));
-  const focus = origin || getTokenCoordinates(tokenId) || { x: 50, y: 50 };
-  state.pendingSteer = { tokenId, alternative, oldTokens, origin: focus };
-  state.camera = focusCameraOn(focus.x, focus.y);
-  state.visualPaused = false;
-  state.pausedGraphTokens = null;
-  state.hoverGhost = null;
-  send({ type: "steer", token_id: tokenId, alternative });
-  addEvent(`queued steering token ${JSON.stringify(alternative.token.trim())}`);
-  renderAll();
+function updateRunIdentity(packet) {
+  const raw = packet.raw_provider_payload || {};
+  const identity = raw.model_identity || {};
+  els.modelRevision.textContent = short(identity.model_revision, 10);
+  els.modelRevision.title = identity.model_revision || "";
+  els.tokenizerRevision.textContent = short(identity.tokenizer_revision, 10);
+  els.tokenizerRevision.title = identity.tokenizer_revision || "";
+  els.promptTokens.textContent = raw.prompt_tokens === undefined ? "— tokens" : `${raw.prompt_tokens} tokens`;
+  els.fingerprint.textContent = short(raw.run_fingerprint, 10);
+  els.fingerprint.title = raw.run_fingerprint || "";
+  const metrics = packet.metrics || {};
+  if (metrics.time_to_first_token_ms) els.ttft.textContent = formatMetric(metrics.time_to_first_token_ms);
+  if (metrics.process_rss_bytes) els.processRam.textContent = formatBytes(metrics.process_rss_bytes.value);
+  if (metrics.process_cpu_percent) els.cpuUse.textContent = `${formatNumber(metrics.process_cpu_percent.value, 1)}%`;
 }
 
-function selectToken(tokenId) {
-  state.selectedTokenId = tokenId;
-  renderAll();
-}
-
-function evaporate() {
-  send({ type: "evaporate" });
+function renderTruthBanner(status) {
+  const isReal = status === "real";
+  els.truthBanner.className = `truth-banner ${isReal ? "real" : "synthetic"}`;
+  els.truthBanner.innerHTML = isReal
+    ? "<strong>MEASURED LOCALLY</strong><span>Values come from the selected model runtime or a named formula. Unsupported signals stay unavailable.</span>"
+    : "<strong>DEMO DATA</strong><span>The demo is synthetic and visibly labeled. Choose Transformers for real model measurements.</span>";
 }
 
 function renderAll() {
-  els.tokenCount.textContent = state.tokens.length;
-  els.rewriteCount.textContent = state.rewrites;
-  if (state.visualPaused && state.hoverGhost) {
-    els.graphCanvas.classList.add("paused");
-    renderGhostDashboardOnly();
-  } else {
-    renderGraph();
-  }
-  renderTokenStream();
-  renderInspector();
-  renderEvents();
-  renderCompare();
+  renderTokens(); renderTranscript(); renderSelected(); renderMechanics(); renderCausalPath(); renderLedger();
+  els.tokenCount.textContent = `${state.tokens.length} token${state.tokens.length === 1 ? "" : "s"}`;
+  els.rewriteCount.textContent = `${state.rewrites.length} change${state.rewrites.length === 1 ? "" : "s"}`;
+  els.exportLink.href = `/api/sessions/${state.sessionId}/export.jsonl`;
+  els.exportLink.classList.toggle("disabled", state.tokens.length === 0);
+  els.exportLink.setAttribute("aria-disabled", String(state.tokens.length === 0));
 }
 
-function renderGraph() {
-  const graphTokens = getGraphTokens();
-  const visible = graphTokens.slice(-7);
-  const coordinates = visible.map((packet, index) => ({
-    tokenId: packet.token_id,
-    x: dominantPathX(index, visible.length),
-    y: 50,
-  }));
-  const coordinateById = new Map(coordinates.map((coordinate) => [coordinate.tokenId, coordinate]));
-  const tokenNodes = visible.map((packet, index) => tokenNode(packet, coordinates[index]));
-  const ghostNodes = visible.flatMap((packet, index) =>
-    (packet.alternatives || []).slice(0, 5).map((alternative, alternativeIndex) =>
-      ghostNode(packet, alternative, alternativeIndex, coordinates[index]),
-    ),
-  );
-  const collapsed = collapsedBranchNodes(coordinateById);
-  const highwayLines = coordinates.slice(1).map((coordinate, index) =>
-    weightedLine(coordinates[index].x, coordinates[index].y, coordinate.x, coordinate.y, 1, "highway-line"),
-  );
-  const ghostLines = visible.flatMap((packet, index) =>
-    (packet.alternatives || []).slice(0, 5).map((alternative, alternativeIndex) => {
-      const tokenCoordinate = coordinates[index];
-      const ghostCoordinate = ghostCoordinates(tokenCoordinate, alternativeIndex);
-      const weight = logprobWeight(alternative.logprob);
-      return weightedLine(tokenCoordinate.x, tokenCoordinate.y, ghostCoordinate.x, ghostCoordinate.y, weight, "ghost-line");
-    }),
-  );
-  const collapsedLines = collapsed.lines;
-  const dashboard = state.hoverGhost ? ghostDashboard(state.hoverGhost) : "";
-  const cameraStyle = `--camera-shift-x:${((50 - state.camera.x) * 0.3).toFixed(2)}%; --camera-shift-y:${((50 - state.camera.y) * 0.3).toFixed(2)}%; --camera-scale:${state.camera.scale};`;
-
-  els.graphCanvas.classList.toggle("paused", state.visualPaused);
-
-  const nodes = [
-    node("Prompt", "ingest", 12, 50, "active system-node"),
-    node("Prompt checks", contextVerdict("constraint_bounds"), 17, 28, state.subContext ? "active system-node" : "system-node"),
-    node("Live path", "accepted tokens", 17, 72, visible.length ? "active system-node" : "system-node"),
-    ...tokenNodes,
-    ...ghostNodes,
-    ...collapsed.nodes,
-  ];
-
-  els.graphCanvas.innerHTML = `
-    <div class="graph-camera" style="${cameraStyle}">
-      <svg class="graph-lines" viewBox="0 0 100 100" preserveAspectRatio="none">
-        ${line(12, 50, 17, 28)}
-        ${line(12, 50, 17, 72)}
-        ${coordinates.length ? line(17, 72, coordinates[0].x, coordinates[0].y, "amber") : ""}
-        ${highwayLines.join("")}
-        ${ghostLines.join("")}
-        ${collapsedLines.join("")}
-      </svg>
-      ${nodes.join("")}
-    </div>
-    ${dashboard}
-  `;
-
-  els.graphCanvas.querySelectorAll(".dominant-node[data-token-id]").forEach((item) => {
-    item.addEventListener("click", () => selectToken(Number(item.dataset.tokenId)));
-  });
-  els.graphCanvas.querySelectorAll(".ghost-node").forEach((item) => {
-    const tokenId = Number(item.dataset.tokenId);
-    const alternativeIndex = Number(item.dataset.alternativeIndex);
-    const packet = getGraphTokens().find((token) => token.token_id === tokenId);
-    const alternative = packet?.alternatives?.[alternativeIndex];
-    if (!packet || !alternative) return;
-    const origin = { x: Number(item.dataset.x), y: Number(item.dataset.y) };
-    item.addEventListener("mouseenter", () => handleGhostHover(packet, alternative, alternativeIndex, origin));
-    item.addEventListener("mouseleave", clearGhostHover);
-    item.addEventListener("click", (event) => {
-      event.stopPropagation();
-      handleGhostClick(packet, alternative, alternativeIndex, origin);
-    });
-  });
-}
-
-function node(title, subtitle, x, y, className = "", tokenId = null) {
-  const tokenAttr = tokenId === null ? "" : ` data-token-id="${tokenId}"`;
-  return `
-    <button class="graph-node ${className}" style="left:${x}%; top:${y}%;"${tokenAttr}>
-      <strong>${escapeHtml(title)}</strong>
-      <span>${escapeHtml(subtitle)}</span>
-    </button>
-  `;
-}
-
-function tokenNode(packet, coordinate) {
-  const logprob = tokenMetric(packet, "logprob");
-  const probability = tokenMetric(packet, "probability");
-  const weight = logprobWeight(metricValue(logprob, packet.logprob));
-  const isPendingDiscard = state.pendingSteer && packet.token_id >= state.pendingSteer.tokenId;
-  const className = [
-    "dominant-node",
-    packet.token_id === state.selectedTokenId ? "selected" : "",
-    packet.token_id === state.originTokenId ? "origin" : "",
-    packet.rewritten ? "rewritten" : "",
-    isPendingDiscard ? "collapsing" : "",
-  ].filter(Boolean).join(" ");
-  return `
-    <button class="graph-node ${className}" data-token-id="${packet.token_id}" style="left:${coordinate.x}%; top:${coordinate.y}%; --node-weight:${weight};">
-      <strong>${escapeHtml(cleanToken(packet.token))}</strong>
-      <span>${statusBadgeHtml(probability?.status || logprob?.status)} ${escapeHtml(metricSummary(probability, packet.probability, "probability"))}</span>
-    </button>
-  `;
-}
-
-function ghostNode(packet, alternative, alternativeIndex, tokenCoordinate) {
-  const coordinate = ghostCoordinates(tokenCoordinate, alternativeIndex);
-  const logprob = alternativeMetric(alternative, "logprob");
-  const probability = alternativeMetric(alternative, "probability");
-  const weight = logprobWeight(metricValue(logprob, alternative.logprob));
-  const probabilityValue = metricValue(probability, alternative.probability ?? probabilityFromLogprob(alternative.logprob));
-  return `
-    <button
-      class="ghost-node"
-      data-token-id="${packet.token_id}"
-      data-alternative-index="${alternativeIndex}"
-      data-x="${coordinate.x}"
-      data-y="${coordinate.y}"
-      style="left:${coordinate.x}%; top:${coordinate.y}%; --ghost-opacity:${ghostOpacity(weight)}; --ghost-size:${ghostSize(weight)}px; --ghost-glow:${ghostGlow(weight)}px;"
-      aria-label="Steer token ${packet.token_id} to ${escapeHtml(cleanToken(alternative.token))}"
-    >
-      <strong>${escapeHtml(cleanToken(alternative.token))}</strong>
-      <span>${statusBadgeHtml(alternative.status || probability?.status)} ${formatPercent(probabilityValue)}</span>
-    </button>
-  `;
-}
-
-function ghostDashboard(ghost) {
-  const logprob = alternativeMetric(ghost.alternative, "logprob");
-  const probability = alternativeMetric(ghost.alternative, "probability");
-  const probabilityValue = metricValue(probability, ghost.alternative.probability ?? probabilityFromLogprob(ghost.alternative.logprob));
-  const left = Math.min(78, Math.max(12, ghost.origin.x + 4));
-  const top = Math.min(78, Math.max(10, ghost.origin.y - 10));
-  return `
-    <aside class="ghost-dashboard" style="left:${left}%; top:${top}%;">
-      <div>Alternative path ${statusBadgeHtml(ghost.alternative.status || probability?.status)}</div>
-      <strong>${escapeHtml(JSON.stringify(ghost.alternative.token))}</strong>
-      <dl>
-        <dt>token_id</dt><dd>${ghost.packet.token_id}</dd>
-        <dt>logprob</dt><dd>${escapeHtml(metricSummary(logprob, ghost.alternative.logprob, "logprob"))}</dd>
-        <dt>probability</dt><dd>${escapeHtml(metricSummary(probability, probabilityValue, "probability"))}</dd>
-        <dt>evidence</dt><dd>${escapeHtml(probability?.evidence_id || logprob?.evidence_id || "none")}</dd>
-      </dl>
-      <p><b>What it means:</b> ${escapeHtml(probability?.plain_explanation || "An alternate continuation available at this token.")}</p>
-      <p>${escapeHtml(ghost.alternative.rationale || "Alternative semantic branch.")}</p>
-      ${state.expertMode ? rawBlock("Alternative metric", ghost.alternative.metrics || {}) : ""}
-    </aside>
-  `;
-}
-
-function collapsedBranchNodes(coordinateById) {
-  const branches = [];
-  if (state.pendingSteer) {
-    branches.push({
-      from: state.pendingSteer.tokenId,
-      tokens: state.pendingSteer.oldTokens,
-      origin: state.pendingSteer.origin,
-    });
-  }
-  branches.push(...state.collapsedBranches);
-
-  const nodes = [];
-  const lines = [];
-  for (const branch of branches.slice(-2)) {
-    const anchor = branch.origin || coordinateById.get(branch.from) || { x: 50, y: 50 };
-    const tokens = (branch.tokens || []).slice(0, 6);
-    tokens.forEach((packet, index) => {
-      const x = Math.min(92, anchor.x + index * 3.2);
-      const y = Math.min(93, anchor.y + 15 + index * 1.8);
-      if (index === 0) {
-        lines.push(weightedLine(anchor.x, anchor.y, x, y, 0.32, "discarded-line"));
-      } else {
-        const priorX = Math.min(92, anchor.x + (index - 1) * 3.2);
-        const priorY = Math.min(93, anchor.y + 15 + (index - 1) * 1.8);
-        lines.push(weightedLine(priorX, priorY, x, y, 0.22, "discarded-line"));
-      }
-      nodes.push(`
-        <span class="discarded-node" style="left:${x}%; top:${y}%;">
-          ${escapeHtml(cleanToken(packet.token))}
-        </span>
-      `);
-    });
-  }
-  return { nodes, lines };
-}
-
-function line(x1, y1, x2, y2, className = "") {
-  return `<line class="${className}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" />`;
-}
-
-function weightedLine(x1, y1, x2, y2, weight, className = "") {
-  return `<line class="${className}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" style="--line-weight:${weight};" />`;
-}
-
-function renderTokenStream() {
-  els.tokenStream.innerHTML = "";
-  for (const packet of state.tokens) {
-    const button = document.createElement("button");
-    button.className = `token-pill${packet.token_id === state.selectedTokenId ? " selected" : ""}${packet.rewritten ? " rewritten" : ""}`;
-    button.textContent = packet.token.replace(/\s/g, " ");
-    button.addEventListener("click", () => selectToken(packet.token_id));
-    els.tokenStream.append(button);
-  }
-}
-
-function renderInspector() {
-  const packet = state.tokens.find((token) => token.token_id === state.selectedTokenId);
-  if (!packet) {
-    els.selectedToken.className = "selected-token empty";
-    els.selectedToken.textContent = "Click a streamed token to inspect its alternatives.";
-    els.alternatives.innerHTML = "";
-    els.hiddenState.innerHTML = "";
+function renderTokens() {
+  if (!state.tokens.length) {
+    els.tokenBody.innerHTML = '<tr class="empty-row"><td colspan="8">Run an experiment to populate measured token decisions.</td></tr>';
     return;
   }
+  els.tokenBody.innerHTML = state.tokens.map((packet) => {
+    const metrics = packet.metrics || {};
+    const status = packet.token_event?.logprob?.status || metrics.token_logprob?.status || "unavailable";
+    const cells = metricColumns.map(([name]) => metricCell(packet, metrics[name], name)).join("");
+    return `<tr class="${packet.token_id === state.selectedTokenId ? "selected" : ""}" data-token-row="${packet.token_id}">
+      <td>${packet.token_id}</td><td><button class="token-button" data-select-token="${packet.token_id}">${escapeHtml(visibleToken(packet.token))}</button></td>
+      <td><span class="status ${escapeHtml(status)}">${escapeHtml(status.toUpperCase())}</span></td>${cells}</tr>`;
+  }).join("");
+}
 
-  const logprob = tokenMetric(packet, "logprob");
-  const probability = tokenMetric(packet, "probability");
-  const latency = tokenMetric(packet, "latency_ms");
-  els.selectedToken.className = "selected-token";
-  els.selectedToken.innerHTML = `
-    <strong>Token ${packet.token_id}</strong> ${statusBadgeHtml(probability?.status || logprob?.status)}<br />
-    <code>${escapeHtml(JSON.stringify(packet.token))}</code>
-    <dl class="metric-list">
-      <dt>Probability</dt><dd>${escapeHtml(metricSummary(probability, packet.probability, "probability"))}</dd>
-      <dt>Logprob</dt><dd>${escapeHtml(metricSummary(logprob, packet.logprob, "logprob"))}</dd>
-      <dt>Latency</dt><dd>${escapeHtml(metricSummary(latency, null, "ms"))}</dd>
-      <dt>Evidence</dt><dd>${escapeHtml(probability?.evidence_id || logprob?.evidence_id || "none")}</dd>
-    </dl>
-    <p><b>Why this number?</b> ${escapeHtml(probability?.plain_explanation || logprob?.plain_explanation || "No probability metric was returned for this token.")}</p>
-    <p><b>Where did this come from?</b> ${escapeHtml(sourceLine(packet, probability || logprob))}</p>
-    ${state.expertMode ? rawBlock("Raw token event", packet.token_event || packet) : ""}
-  `;
+function metricCell(packet, metric, name) {
+  const status = metric?.status || "unavailable";
+  return `<td><button class="metric-button ${escapeHtml(status)}" data-token="${packet.token_id}" data-metric="${escapeHtml(name)}"><span>${escapeHtml(formatMetric(metric))}</span><small>${escapeHtml(status.toUpperCase())}</small></button></td>`;
+}
 
-  els.alternatives.innerHTML = "";
-  for (const alternative of packet.alternatives || []) {
-    const alternativeLogprob = alternativeMetric(alternative, "logprob");
-    const alternativeProbability = alternativeMetric(alternative, "probability");
-    const button = document.createElement("button");
-    button.className = "alternative-button";
-    button.innerHTML = `
-      <code>${escapeHtml(JSON.stringify(alternative.token))}</code>
-      <span>${statusBadgeHtml(alternative.status || alternativeProbability?.status)} ${escapeHtml(metricSummary(alternativeProbability, alternative.probability, "probability"))}</span>
-      <small><b>Use this path</b> ${escapeHtml(alternative.rationale || "Rewrite model history from this point.")}</small>
-      <small>Evidence: ${escapeHtml(alternativeProbability?.evidence_id || alternativeLogprob?.evidence_id || "none")}</small>
-    `;
-    button.addEventListener("click", () => handleAlternativeClick(packet.token_id, alternative));
-    els.alternatives.append(button);
+function visibleToken(token) {
+  if (token === " ") return "␠";
+  if (token === "\n") return "↵";
+  return String(token ?? "").replaceAll("\n", "↵").replaceAll(" ", "·");
+}
+
+function renderTranscript() {
+  if (!state.tokens.length) { els.transcript.textContent = "Awaiting a measured continuation."; return; }
+  els.transcript.textContent = state.tokens.map((packet) => packet.token).join("");
+}
+
+function selectedPacket() {
+  return state.tokens.find((token) => token.token_id === state.selectedTokenId) || null;
+}
+
+function renderSelected() {
+  const packet = selectedPacket();
+  if (!packet) {
+    els.selectedMetric.className = "selected-metric empty-state";
+    els.selectedMetric.textContent = "Select any displayed number to ask where it came from.";
+    els.alternatives.className = "alternatives empty-state";
+    els.alternatives.textContent = "No token selected.";
+    return;
   }
+  const metric = (packet.metrics || {})[state.selectedMetricName] || packet.token_event?.logprob;
+  renderMetricEvidence(metric, packet);
+  const alternatives = packet.alternatives || [];
+  els.alternatives.className = "alternatives";
+  els.alternatives.innerHTML = alternatives.length ? alternatives.map((alternative, index) => {
+    const probability = alternative.metrics?.probability || null;
+    return `<button class="alternative" data-alternative="${index}"><span><b>${escapeHtml(visibleToken(alternative.token))}</b><small>rank ${alternative.rank || index + 1}</small></span><span>${escapeHtml(formatMetric(probability))}<small>${escapeHtml(String(alternative.status || "unavailable").toUpperCase())}</small></span></button>`;
+  }).join("") : '<div class="empty-state">This backend returned no alternatives.</div>';
+}
 
-  els.hiddenState.innerHTML = "";
-  for (const [key, value] of Object.entries(packet.hidden_state || {})) {
-    const metric = packet.hidden_state_metrics?.[key] || syntheticLegacySignal(key, value);
-    const row = document.createElement("div");
-    row.className = "state-row";
-    row.innerHTML = `
-      <span>${escapeHtml(metric.display_label || key)} ${statusBadgeHtml(metric.status)}</span>
-      <span class="bar"><i style="--value:${Math.round(value * 100)}%"></i></span>
-      <b title="${escapeHtml(metric.plain_explanation)}">${value}</b>
-    `;
-    els.hiddenState.append(row);
+function renderMetricEvidence(metric, packet) {
+  if (!metric) {
+    els.selectedMetric.className = "selected-metric unavailable";
+    els.selectedMetric.innerHTML = '<span class="status unavailable">UNAVAILABLE</span><h3>No measurement emitted</h3><p>The backend did not provide this field; Cogito did not estimate it.</p>';
+    return;
   }
+  const evidence = (packet.evidence || []).find((record) => record.evidence_id === metric.evidence_id) || {};
+  els.selectedMetric.className = `selected-metric ${metric.status}`;
+  els.selectedMetric.innerHTML = `
+    <div class="metric-heading"><span class="status ${escapeHtml(metric.status)}">${escapeHtml(metric.status.toUpperCase())}</span><code>token ${packet.token_id}</code></div>
+    <h3>${escapeHtml(metric.display_label || metric.name)}</h3><div class="metric-value">${escapeHtml(formatMetric(metric))}</div>
+    <dl><dt>Source</dt><dd>${escapeHtml(metric.source_name || evidence.source_name || "Not supplied")}</dd>
+    <dt>Field</dt><dd>${escapeHtml(evidence.source_field || "Not supplied")}</dd>
+    <dt>Capability</dt><dd>${escapeHtml(metric.capability || evidence.capability || "Not declared")}</dd>
+    <dt>Formula</dt><dd>${escapeHtml(metric.formula || evidence.formula || "Direct measurement")}</dd>
+    <dt>Collected</dt><dd>${escapeHtml(new Date((metric.collected_at || evidence.created_at || Date.now() / 1000) * 1000).toLocaleTimeString())}</dd></dl>
+    <p>${escapeHtml(metric.caveat || evidence.caveat || metric.plain_explanation || "No additional caveat recorded.")}</p>`;
+}
+
+function renderMechanics() {
+  const packet = selectedPacket(); const raw = packet?.raw_provider_payload || {};
+  const layers = raw.layer_summaries || [];
+  els.mechanicsToken.textContent = packet ? `token ${packet.token_id} · ${visibleToken(packet.token)}` : "select a token";
+  if (!layers.length) {
+    els.layerChart.className = "layer-chart empty-state";
+    els.layerChart.textContent = "Layer summaries are unavailable for this token; no hidden-state value has been inferred.";
+    return;
+  }
+  const maxNorm = Math.max(...layers.map((layer) => layer.l2_norm || 0), 1);
+  els.layerChart.className = "layer-chart";
+  els.layerChart.innerHTML = `<div class="layer-key"><span>L2 norm</span><span>${layers.length} retained layer summaries · DERIVED from real hidden tensors</span></div><div class="layer-bars">${layers.map((layer) => `<button title="Layer ${layer.layer_index}: norm ${formatNumber(layer.l2_norm)}, delta ${formatNumber(layer.delta_l2)}"><i style="height:${Math.max(5, (layer.l2_norm / maxNorm) * 100)}%"></i><span>${layer.layer_index}</span></button>`).join("")}</div>`;
+}
+
+function renderCausalPath() {
+  if (!state.tokens.length) {
+    els.causalPath.className = "causal-path empty-state"; els.causalPath.textContent = "Prompt → prefill → token decisions"; els.resources.innerHTML = ""; return;
+  }
+  const packet = selectedPacket() || state.tokens.at(-1);
+  els.causalPath.className = "causal-path";
+  els.causalPath.innerHTML = `<span>Prompt</span><i>→</i><span>Prefill</span><i>→</i>${state.tokens.slice(-5).map((item) => `<button data-select-token="${item.token_id}" class="${item.token_id === packet.token_id ? "active" : ""}">${escapeHtml(visibleToken(item.token))}</button>`).join('<i>→</i>')}`;
+  const resource = packet.raw_provider_payload?.resource_sample || {};
+  els.resources.innerHTML = `<div><span>Process RSS</span><strong>${formatBytes(resource.process_rss_bytes)}</strong></div><div><span>System memory</span><strong>${resource.system_memory_percent == null ? "Unavailable" : `${formatNumber(resource.system_memory_percent, 1)}%`}</strong></div><div><span>Process CPU</span><strong>${resource.process_cpu_percent == null ? "Unavailable" : `${formatNumber(resource.process_cpu_percent, 1)}%`}</strong></div>`;
+}
+
+function renderCapabilityMatrix(record) {
+  const capabilities = record?.capabilities || {};
+  const preferred = ["selected_token_logprobs", "top_k_alternatives", "raw_logits", "hidden_states", "attentions", "kv_cache_metrics", "system_resource_telemetry", "branch_replay"];
+  els.capabilityMatrix.innerHTML = preferred.map((name) => {
+    const capability = capabilities[name];
+    if (!capability) return "";
+    const visualStatus = capability.support === "supported" ? capability.status_when_present || "real" : "unavailable";
+    return `<button data-capability="${escapeHtml(name)}" title="${escapeHtml(capability.limitation || capability.granularity)}"><span>${escapeHtml(name.replaceAll("_", " "))}</span><strong class="${escapeHtml(visualStatus)}">${escapeHtml(capability.support.toUpperCase())}</strong></button>`;
+  }).join("");
+}
+
+function renderCapabilityEvidence(name) {
+  const capability = state.capabilityRecord?.capabilities?.[name] || state.provider?.capability_record?.capabilities?.[name];
+  if (!capability) return;
+  const status = capability.support === "supported" ? capability.status_when_present || "real" : "unavailable";
+  els.selectedMetric.className = `selected-metric ${status}`;
+  els.selectedMetric.innerHTML = `<div class="metric-heading"><span class="status ${escapeHtml(status)}">${escapeHtml(status.toUpperCase())}</span><code>capability</code></div>
+    <h3>${escapeHtml(name.replaceAll("_", " "))}</h3><div class="metric-value capability-value">${escapeHtml(capability.support.toUpperCase())}</div>
+    <dl><dt>Backend</dt><dd>${escapeHtml(state.capabilityRecord?.provider_name || state.provider?.name || "Not selected")}</dd>
+    <dt>Granularity</dt><dd>${escapeHtml(capability.granularity)}</dd>
+    <dt>Status</dt><dd>${escapeHtml(status.toUpperCase())}</dd></dl>
+    <p>${escapeHtml(capability.limitation || "The backend exposes this capability at the stated granularity.")}</p>`;
+}
+
+function renderLedger() {
+  if (!state.rewrites.length) {
+    els.ledger.className = "ledger empty-state";
+    els.ledger.textContent = "Selecting an alternate token records the old run, new run, invalidated suffix, and replay method.";
+    return;
+  }
+  els.ledger.className = "ledger";
+  els.ledger.innerHTML = state.rewrites.map((entry) => `<article><div><span class="status ${escapeHtml(entry.status)}">${escapeHtml(String(entry.status).toUpperCase())}</span><strong>${escapeHtml(entry.intervention_type.replaceAll("_", " "))}</strong></div><p>${short(entry.old_run_id, 8)} → ${short(entry.new_run_id, 8)} · token ${entry.token_id}</p><small>${entry.reused_prefix_tokens} prefix tokens reused · ${entry.invalidated_token_count} invalidated · recompute from ${entry.recomputed_from_token}</small></article>`).join("");
 }
 
 function renderEvents() {
-  els.eventLog.innerHTML = state.events
-    .slice(-9)
-    .map((event) => `<li>${escapeHtml(event)}</li>`)
-    .join("");
-}
-
-function renderCompare() {
-  if (!state.lastComparison) {
-    els.comparePanel.className = "compare-panel empty";
-    els.comparePanel.textContent = "Change a path to compare branches.";
-    return;
-  }
-  const comparison = state.lastComparison;
-  const probability = alternativeMetric(comparison.alternative || {}, "probability");
-  const logprob = alternativeMetric(comparison.alternative || {}, "logprob");
-  els.comparePanel.className = "compare-panel";
-  els.comparePanel.innerHTML = `
-    <div class="panel-title">Compare branches</div>
-    <p>You changed the path at token ${comparison.tokenId}. The system restarted from that point with the selected token.</p>
-    <dl class="metric-list">
-      <dt>Changed token</dt><dd><code>${escapeHtml(JSON.stringify(comparison.changedToken))}</code></dd>
-      <dt>Selected metric</dt><dd>${escapeHtml(metricSummary(probability || logprob, comparison.alternative?.logprob, "probability/logprob"))}</dd>
-      <dt>Old run</dt><dd>${escapeHtml(comparison.oldRunId || "unknown")}</dd>
-      <dt>New run</dt><dd>${escapeHtml(comparison.newRunId || "unknown")}</dd>
-    </dl>
-    <div class="branch-text">
-      <section><b>Before</b><p>${escapeHtml(comparison.before || "(empty)")}</p></section>
-      <section><b>After</b><p>${escapeHtml(comparison.after || "(empty)")}</p></section>
-    </div>
-    ${comparison.rationale ? `<p><b>Why it matters:</b> ${escapeHtml(comparison.rationale)}</p>` : ""}
-  `;
-}
-
-function addEvent(text) {
-  const timestamp = new Date().toLocaleTimeString([], { hour12: false });
-  state.events.push(`${timestamp} ${text}`);
-  renderEvents();
-}
-
-function contextVerdict(key) {
-  const item = state.subContext?.[key];
-  if (!item) return "pending";
-  return `${Math.round(item.confidence * 100)}% SYNTHETIC ${item.signals?.[0] || "validated"}`;
-}
-
-function getGraphTokens() {
-  return state.visualPaused && state.pausedGraphTokens ? state.pausedGraphTokens : state.tokens;
-}
-
-function getTokenCoordinates(tokenId) {
-  const visible = getGraphTokens().slice(-7);
-  const index = visible.findIndex((packet) => packet.token_id === tokenId);
-  if (index === -1) return null;
-  return {
-    x: dominantPathX(index, visible.length),
-    y: 50,
-  };
-}
-
-function dominantPathX(index, length) {
-  return length === 1 ? 52 : 24 + index * (54 / Math.max(1, length - 1));
-}
-
-function ghostCoordinates(tokenCoordinate, alternativeIndex) {
-  const offsets = [
-    { x: -3.5, y: -30 },
-    { x: 4.5, y: -18 },
-    { x: -4.5, y: 18 },
-    { x: 4, y: 30 },
-    { x: -1.5, y: 40 },
-  ];
-  const offset = offsets[alternativeIndex] || offsets[offsets.length - 1];
-  return {
-    x: Math.min(94, Math.max(6, tokenCoordinate.x + offset.x)),
-    y: Math.min(94, Math.max(8, tokenCoordinate.y + offset.y)),
-  };
-}
-
-function handleGhostHover(packet, alternative, alternativeIndex, origin) {
-  if (!state.visualPaused) {
-    state.pausedGraphTokens = state.tokens.map((token) => ({ ...token }));
-  }
-  state.visualPaused = true;
-  state.hoverGhost = { packet, alternative, alternativeIndex, origin };
-  els.graphCanvas.classList.add("paused");
-  renderGhostDashboardOnly();
-}
-
-function clearGhostHover() {
-  state.visualPaused = false;
-  state.pausedGraphTokens = null;
-  state.hoverGhost = null;
-  renderGraph();
-}
-
-function renderGhostDashboardOnly() {
-  els.graphCanvas.querySelector(".ghost-dashboard")?.remove();
-  if (state.hoverGhost) {
-    els.graphCanvas.insertAdjacentHTML("beforeend", ghostDashboard(state.hoverGhost));
+  els.events.innerHTML = "";
+  for (const item of state.events.slice(0, 12)) {
+    const li = document.createElement("li");
+    const time = document.createElement("time"); time.textContent = item.at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    const span = document.createElement("span"); span.textContent = item.label;
+    li.append(time, span); els.events.append(li);
   }
 }
 
-function handleGhostClick(packet, alternative, alternativeIndex, origin) {
-  state.originTokenId = packet.token_id;
-  queueSteer(packet.token_id, alternative, origin || ghostCoordinates(getTokenCoordinates(packet.token_id), alternativeIndex));
-}
-
-function focusCameraOn(x, y) {
-  return { x, y, scale: 1.08 };
-}
-
-function tokenMetric(packet, name) {
-  if (name === "logprob") return packet.token_event?.logprob || packet.metrics?.token_logprob || null;
-  if (name === "probability") return packet.token_event?.probability || packet.metrics?.token_probability || null;
-  if (name === "latency_ms") return packet.token_event?.latency_ms || packet.metrics?.token_latency_ms || null;
-  if (name === "byte_length") return packet.token_event?.byte_length || packet.metrics?.byte_length || null;
-  return packet.metrics?.[name] || null;
-}
-
-function alternativeMetric(alternative, name) {
-  return alternative.metrics?.[name] || alternative.metrics?.[`alternative_${alternative.rank}_${name}`] || null;
-}
-
-function metricValue(metric, fallback = null) {
-  const value = metric?.value ?? fallback;
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : value;
-}
-
-function metricSummary(metric, fallback = null, unitHint = "") {
-  if (!metric && fallback === null) return "not returned";
-  const value = metricValue(metric, fallback);
-  if (value === null || value === undefined) return "not returned";
-  const unit = metric?.unit || unitHint;
-  if (unit === "probability") return `${formatPercent(Number(value))} (${metric?.status || "unknown"})`;
-  if (unit === "ms") return `${Number(value).toFixed(1)}ms (${metric?.status || "unknown"})`;
-  if (typeof value === "number") return `${Number(value).toFixed(3)} ${unit}`.trim() + ` (${metric?.status || "unknown"})`;
-  return `${value} (${metric?.status || "unknown"})`;
-}
-
-function statusBadgeHtml(status = "unknown") {
-  return `<span class="status-badge ${escapeHtml(status)}">${escapeHtml(String(status).toUpperCase())}</span>`;
-}
-
-function sourceLine(packet, metric) {
-  if (!metric) return "No provider or runtime source was attached.";
-  const evidence = (packet.evidence || []).find((record) => record.evidence_id === metric.evidence_id);
-  if (!evidence) return `Evidence record ${metric.evidence_id} is referenced but not in this packet.`;
-  const field = evidence.source_field ? ` field ${evidence.source_field}` : "";
-  const caveat = evidence.caveat ? ` Caveat: ${evidence.caveat}` : "";
-  return `${evidence.source_kind.toUpperCase()} from ${evidence.source_name}${field}.${caveat}`;
-}
-
-function providerLabel(provider) {
-  if (!provider) return "unknown";
-  return provider.available === false ? `${provider.mode}: unavailable` : provider.mode;
-}
-
-function rawBlock(label, value) {
-  return `
-    <details class="raw-details">
-      <summary>${escapeHtml(label)}</summary>
-      <pre>${escapeHtml(JSON.stringify(value, null, 2))}</pre>
-    </details>
-  `;
-}
-
-function syntheticLegacySignal(key, value) {
-  return {
-    name: `legacy_${key}`,
-    value,
-    unit: "score",
-    status: "synthetic",
-    evidence_id: "legacy-unpersisted",
-    display_label: key.replaceAll("_", " "),
-    plain_explanation: "Legacy local signal; treated as synthetic because no provider evidence was attached.",
-  };
-}
-
-function logprobWeight(logprob) {
-  const value = Number(logprob);
-  if (!Number.isFinite(value)) return 0.45;
-  return Math.min(1, Math.max(0.08, (value + 5) / 5));
-}
-
-function probabilityFromLogprob(logprob) {
-  const value = Number(logprob);
-  if (!Number.isFinite(value)) return 0;
-  return Math.exp(value);
-}
-
-function formatPercent(probability) {
-  return `${(probability * 100).toFixed(probability > 0.1 ? 1 : 2)}%`;
-}
-
-function ghostOpacity(weight) {
-  return (0.16 + weight * 0.84).toFixed(3);
-}
-
-function ghostSize(weight) {
-  return Math.round(40 + weight * 34);
-}
-
-function ghostGlow(weight) {
-  return Math.round(4 + weight * 28);
-}
-
-function cleanToken(token) {
-  const value = (token || "").trim();
-  return value || "space";
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-els.start.addEventListener("click", startStream);
-els.evaporate.addEventListener("click", evaporate);
-els.expertToggle.addEventListener("change", () => {
-  state.expertMode = els.expertToggle.checked;
-  renderAll();
+document.addEventListener("click", (event) => {
+  const capability = event.target.closest("[data-capability]");
+  if (capability) { renderCapabilityEvidence(capability.dataset.capability); return; }
+  const metric = event.target.closest("[data-metric]");
+  if (metric) { state.selectedTokenId = Number(metric.dataset.token); state.selectedMetricName = metric.dataset.metric; renderAll(); return; }
+  const token = event.target.closest("[data-select-token]");
+  if (token) { state.selectedTokenId = Number(token.dataset.selectToken); state.selectedMetricName = "token_logprob"; renderAll(); return; }
+  const alternativeButton = event.target.closest("[data-alternative]");
+  if (alternativeButton) {
+    const packet = selectedPacket(); const alternative = packet?.alternatives?.[Number(alternativeButton.dataset.alternative)];
+    if (packet && alternative) { send({ type: "steer", token_id: packet.token_id, alternative }); addEvent(`Steering requested: ${visibleToken(alternative.token)}`); }
+  }
 });
+
+els.start.addEventListener("click", startExperiment);
+els.evaporate.addEventListener("click", () => { send({ type: "evaporate" }); state.tokens = []; state.rewrites = []; state.events = []; renderAll(); });
+els.provider.addEventListener("change", selectProvider);
+els.expert.addEventListener("change", () => document.body.classList.toggle("expert", els.expert.checked));
+els.exportLink.addEventListener("click", (event) => { if (els.exportLink.classList.contains("disabled")) event.preventDefault(); });
+
+await loadProviders();
 connect();
 renderAll();
-
-window.handleAlternativeClick = handleAlternativeClick;

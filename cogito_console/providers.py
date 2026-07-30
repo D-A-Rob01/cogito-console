@@ -11,16 +11,28 @@ from typing import Any, Literal
 from .interceptor import LatentBeamInterceptor
 from .metrics import MetricEngine
 from .schemas import (
+    CAPABILITY_NAMES,
     AlternativeTokenEvent,
     EvidenceRecord,
     MetricValue,
+    ProviderCapability,
+    ProviderCapabilityRecord,
+    TelemetryEvent,
     TokenEvent,
     make_evidence,
     metric_dict,
 )
 
 
-ProviderMode = Literal["demo", "openai", "local_model", "mock"]
+ProviderMode = Literal[
+    "demo",
+    "openai",
+    "transformers",
+    "llama_cpp",
+    "moe",
+    "colibri",
+    "mock",
+]
 
 
 class ProviderUnavailableError(RuntimeError):
@@ -33,8 +45,13 @@ class ProviderStreamPacket:
     evidence: list[EvidenceRecord] = field(default_factory=list)
     metrics: list[MetricValue] = field(default_factory=list)
     hidden_state_metrics: dict[str, MetricValue] = field(default_factory=dict)
+    telemetry_events: list[TelemetryEvent] = field(default_factory=list)
 
-    def to_legacy_packet(self) -> dict[str, Any]:
+    def to_legacy_packet(self, provider_name: str | None = None) -> dict[str, Any]:
+        source_name = provider_name or str(
+            (self.token_event.raw_provider_payload or {}).get("source", "provider_adapter")
+        )
+        self.ensure_telemetry_events(source_name)
         raw_payload = dict(self.token_event.raw_provider_payload or {})
         packet = {
             "source": raw_payload.get("source", "provider_adapter"),
@@ -53,9 +70,108 @@ class ProviderStreamPacket:
             "token_event": self.token_event.to_dict(),
             "evidence": [record.to_dict() for record in self.evidence],
             "metrics": {metric.name: metric.to_dict() for metric in self.metrics},
+            "telemetry_events": [event.to_dict() for event in self.telemetry_events],
             "raw_provider_payload": raw_payload,
         }
         return packet
+
+    def ensure_telemetry_events(self, provider_name: str) -> list[TelemetryEvent]:
+        evidence_by_id = {record.evidence_id: record for record in self.evidence}
+        for metric in self._all_metrics():
+            evidence = evidence_by_id.get(metric.evidence_id)
+            if evidence is not None:
+                metric.source_name = metric.source_name or evidence.source_name
+                metric.capability = metric.capability or evidence.capability or _metric_capability(metric.name)
+                metric.formula = metric.formula or evidence.formula
+                metric.caveat = metric.caveat or evidence.caveat
+            else:
+                metric.source_name = metric.source_name or provider_name
+                metric.capability = metric.capability or _metric_capability(metric.name)
+
+        token_event = self.token_event
+        token_status = token_event.logprob.status if token_event.logprob else "real"
+        evidence_ids = [metric.evidence_id for metric in self._all_metrics()]
+        compact_payload = {
+            "token_id": token_event.token_id,
+            "text": token_event.text,
+            "logprob": metric_dict(token_event.logprob),
+            "probability": metric_dict(token_event.probability),
+            "latency_ms": metric_dict(token_event.latency_ms),
+            "alternative_count": len(token_event.alternatives),
+        }
+        existing_types = {event.event_type for event in self.telemetry_events}
+        generated_events = [
+            event
+            for event in [
+                TelemetryEvent(
+                    event_type="token.sampled",
+                    session_id=token_event.session_id,
+                    run_id=token_event.run_id,
+                    status=token_status,
+                    source_name=provider_name,
+                    capability="selected_token_logprobs",
+                    payload=compact_payload,
+                    token_id=token_event.token_id,
+                    evidence_ids=evidence_ids,
+                ),
+                TelemetryEvent(
+                    event_type="token.committed",
+                    session_id=token_event.session_id,
+                    run_id=token_event.run_id,
+                    status=token_status,
+                    source_name="Cogito Console transaction log",
+                    capability="streaming",
+                    payload={"token_id": token_event.token_id, "text": token_event.text},
+                    token_id=token_event.token_id,
+                    evidence_ids=evidence_ids,
+                ),
+            ]
+            if event.event_type not in existing_types
+        ]
+        self.telemetry_events.extend(generated_events)
+        unavailable_evidence_ids = {
+            evidence_id
+            for event in self.telemetry_events
+            if event.event_type == "measurement.unavailable"
+            for evidence_id in event.evidence_ids
+        }
+        for metric in self._all_metrics():
+            if (
+                metric.status == "unavailable"
+                and metric.evidence_id not in unavailable_evidence_ids
+            ):
+                self.telemetry_events.append(
+                    TelemetryEvent(
+                        event_type="measurement.unavailable",
+                        session_id=token_event.session_id,
+                        run_id=token_event.run_id,
+                        status="unavailable",
+                        source_name=metric.source_name or provider_name,
+                        capability=metric.capability,
+                        payload={"metric": metric.to_dict()},
+                        token_id=token_event.token_id,
+                        evidence_ids=[metric.evidence_id],
+                    )
+                )
+        return self.telemetry_events
+
+    def _all_metrics(self) -> list[MetricValue]:
+        metrics = list(self.metrics)
+        metrics.extend(self.hidden_state_metrics.values())
+        for alternative in self.token_event.alternatives:
+            metrics.extend(
+                metric
+                for metric in (
+                    alternative.logprob,
+                    alternative.probability,
+                    alternative.margin_from_selected,
+                )
+                if metric is not None
+            )
+        unique: dict[str, MetricValue] = {}
+        for metric in metrics:
+            unique[f"{metric.name}:{metric.evidence_id}"] = metric
+        return list(unique.values())
 
     @staticmethod
     def _alternative_to_legacy(alternative: AlternativeTokenEvent) -> dict[str, Any]:
@@ -90,6 +206,7 @@ class ProviderAdapter(ABC):
         *,
         session_id: str,
         run_id: str,
+        generation_settings: dict[str, Any] | None = None,
     ) -> AsyncIterator[ProviderStreamPacket]:
         ...
 
@@ -99,12 +216,23 @@ class ProviderAdapter(ABC):
     def unavailable_reason(self) -> str | None:
         return None
 
+    def capability_record(self) -> ProviderCapabilityRecord:
+        return ProviderCapabilityRecord(
+            provider_id=self.mode,
+            provider_name=self.name,
+            mode=self.mode,
+            capabilities=_capabilities(),
+        )
+
     def describe(self) -> dict[str, Any]:
+        capability_record = self.capability_record()
         return {
+            "provider_id": capability_record.provider_id,
             "name": self.name,
             "mode": self.mode,
             "available": self.is_available(),
             "unavailable_reason": self.unavailable_reason(),
+            "capability_record": capability_record.to_dict(),
         }
 
 
@@ -121,6 +249,34 @@ class LocalDemoAdapter(ProviderAdapter):
         self.interceptor = interceptor or LatentBeamInterceptor()
         self.enable_synthetic_probes = enable_synthetic_probes
 
+    def capability_record(self) -> ProviderCapabilityRecord:
+        return ProviderCapabilityRecord(
+            provider_id="demo",
+            provider_name=self.name,
+            mode=self.mode,
+            capabilities=_capabilities(
+                streaming=_cap("streaming", "supported", "token", status="synthetic"),
+                token_ids=_cap(
+                    "token_ids",
+                    "conditional",
+                    "whitespace-delimited demo unit",
+                    "IDs describe demo units, not a model tokenizer.",
+                    "synthetic",
+                ),
+                system_resource_telemetry=_cap(
+                    "system_resource_telemetry", "supported", "server process", status="real"
+                ),
+                deterministic_seed=_cap(
+                    "deterministic_seed",
+                    "supported",
+                    "entire demo run",
+                    "The deterministic demo has no stochastic sampler.",
+                    "synthetic",
+                ),
+            ),
+            steering_methods=["narrative_ui_splice"],
+        )
+
     async def stream(
         self,
         prompt: str,
@@ -129,6 +285,7 @@ class LocalDemoAdapter(ProviderAdapter):
         *,
         session_id: str,
         run_id: str,
+        generation_settings: dict[str, Any] | None = None,
     ) -> AsyncIterator[ProviderStreamPacket]:
         source = self.interceptor.stream_with_steering_hooks(
             prompt=prompt,
@@ -340,6 +497,59 @@ class OpenAIAdapter(ProviderAdapter):
             return "OpenAI adapter unavailable: missing OPENAI_API_KEY."
         return None
 
+    def capability_record(self) -> ProviderCapabilityRecord:
+        return ProviderCapabilityRecord(
+            provider_id="openai",
+            provider_name=self.name,
+            mode=self.mode,
+            capabilities=_capabilities(
+                streaming=_cap("streaming", "supported", "streamed chunk", status="real"),
+                selected_token_logprobs=_cap(
+                    "selected_token_logprobs",
+                    "conditional",
+                    "provider token",
+                    "Availability depends on the selected model and endpoint.",
+                    "real",
+                ),
+                top_k_alternatives=_cap(
+                    "top_k_alternatives",
+                    "conditional",
+                    "provider token",
+                    "Availability depends on the selected model and endpoint.",
+                    "real",
+                ),
+                request_queue_metrics=_cap(
+                    "request_queue_metrics",
+                    "conditional",
+                    "request",
+                    "Only values explicitly returned by the API are retained.",
+                    "real",
+                ),
+                system_resource_telemetry=_cap(
+                    "system_resource_telemetry",
+                    "supported",
+                    "Cogito server process",
+                    "Does not describe OpenAI infrastructure.",
+                    "real",
+                ),
+                deterministic_seed=_cap(
+                    "deterministic_seed",
+                    "conditional",
+                    "request",
+                    "Only exposed when supported by the selected API surface.",
+                    "real",
+                ),
+                structured_output=_cap(
+                    "structured_output",
+                    "conditional",
+                    "request",
+                    "Not wired into the current Cogito generation UI.",
+                    "real",
+                ),
+            ),
+            steering_methods=[],
+        )
+
     def describe(self) -> dict[str, Any]:
         payload = super().describe()
         payload["model"] = self.model
@@ -354,6 +564,7 @@ class OpenAIAdapter(ProviderAdapter):
         *,
         session_id: str,
         run_id: str,
+        generation_settings: dict[str, Any] | None = None,
     ) -> AsyncIterator[ProviderStreamPacket]:
         if not self.api_key:
             raise ProviderUnavailableError("OpenAI adapter unavailable: missing OPENAI_API_KEY.")
@@ -564,6 +775,10 @@ def adapter_from_env(interceptor: LatentBeamInterceptor | None = None) -> Provid
     provider = os.getenv("COGITO_PROVIDER", "demo").strip().lower()
     if provider == "openai":
         return OpenAIAdapter()
+    if provider in {"transformers", "reference", "local"}:
+        from .reference_provider import TransformersReferenceAdapter
+
+        return TransformersReferenceAdapter()
     enable_synthetic_probes = os.getenv("COGITO_ENABLE_SYNTHETIC_PROBES", "true").lower() != "false"
     return LocalDemoAdapter(interceptor=interceptor, enable_synthetic_probes=enable_synthetic_probes)
 
@@ -592,3 +807,48 @@ def _extract_openai_logprobs(choice: Any) -> tuple[float | None, list[dict[str, 
             }
         )
     return logprob, top
+
+
+def _cap(
+    name: str,
+    support: Literal["supported", "conditional", "unsupported"],
+    granularity: str,
+    limitation: str | None = None,
+    status: Literal["real", "derived", "synthetic", "unavailable"] | None = None,
+) -> ProviderCapability:
+    return ProviderCapability(
+        name=name,
+        support=support,
+        granularity=granularity,
+        limitation=limitation,
+        status_when_present=status,
+    )
+
+
+def _capabilities(**overrides: ProviderCapability) -> dict[str, ProviderCapability]:
+    capabilities = {
+        name: _cap(
+            name,
+            "unsupported",
+            "unavailable",
+            "The active backend does not expose this capability.",
+            "unavailable",
+        )
+        for name in CAPABILITY_NAMES
+    }
+    capabilities.update(overrides)
+    return capabilities
+
+
+def _metric_capability(metric_name: str) -> str:
+    if "logprob" in metric_name:
+        return "selected_token_logprobs"
+    if metric_name.startswith("alternative_"):
+        return "top_k_alternatives"
+    if "probability" in metric_name or "entropy" in metric_name or "margin" in metric_name:
+        return "raw_logits"
+    if "hidden" in metric_name or "layer" in metric_name:
+        return "hidden_states"
+    if "latency" in metric_name or "speed" in metric_name or "duration" in metric_name:
+        return "system_resource_telemetry"
+    return "streaming"

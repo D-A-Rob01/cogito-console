@@ -1,29 +1,36 @@
+# Python and test environments
+.venv/
+*.egg-info/
 __pycache__/
 *.py[cod]
-*$py.class
-
 .pytest_cache/
 .pytest-tmp*/
-.ruff_cache/
-.mypy_cache/
-.coverage
-htmlcov/
 
-.venv/
-venv/
-env/
+# Local Cogito state and private traces
+data/
+*.sqlite
+*.sqlite-*
+*.db
+runs/
+artifacts/
+traces/
 
-*.log
+# Credentials and machine-local configuration
 .env
 .env.*
 !.env.example
 
-node_modules/
-dist/
-build/
+# Model weights and inference caches
+models/
+.cache/
+*.safetensors
+*.gguf
+*.bin.index.json
+pytorch_model*.bin
+tokenizer.model
 
-*.egg-info/
-data/
-*.sqlite
-*.sqlite-*
-cogito-console-*.png
+# Local QA output
+.qa/
+screenshots/
+playwright-report/
+test-results/

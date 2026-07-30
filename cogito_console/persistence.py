@@ -9,10 +9,15 @@ from pathlib import Path
 from typing import Any
 
 
+SCHEMA_VERSION = 1
+
+
 class PersistenceStore:
     def __init__(self, path: str | Path = "./data/cogito.sqlite", *, enabled: bool = True) -> None:
         self.path = Path(path)
         self.enabled = enabled
+        self.max_event_bytes = int(os.getenv("COGITO_MAX_EVENT_BYTES", "65536"))
+        self.max_export_events = int(os.getenv("COGITO_MAX_EXPORT_EVENTS", "10000"))
         if self.enabled:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._init_db()
@@ -116,7 +121,37 @@ class PersistenceStore:
                     created_at REAL NOT NULL,
                     payload TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_capabilities (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    provider_id TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    payload TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS telemetry_events (
+                    event_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    capability TEXT NOT NULL,
+                    collected_at REAL NOT NULL,
+                    payload TEXT NOT NULL
+                );
                 """
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (SCHEMA_VERSION, time.time()),
             )
 
     def upsert_session(
@@ -235,6 +270,53 @@ class PersistenceStore:
             for metric in metrics:
                 self._save_metric(connection, session_id, event_ref, _payload(metric))
 
+    def save_capability_snapshot(self, session_id: str, run_id: str, record: Any) -> None:
+        if not self.enabled:
+            return
+        payload = _payload(record)
+        serialized = self._bounded_json(payload)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO provider_capabilities(
+                    session_id, run_id, provider_id, created_at, payload
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    run_id,
+                    str(payload["provider_id"]),
+                    float(payload.get("generated_at") or time.time()),
+                    serialized,
+                ),
+            )
+
+    def save_telemetry_events(self, events: list[Any]) -> None:
+        if not self.enabled or not events:
+            return
+        with self._connect() as connection:
+            for event in events:
+                payload = _payload(event)
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO telemetry_events(
+                        event_id, session_id, run_id, sequence, event_type,
+                        status, capability, collected_at, payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(payload["event_id"]),
+                        str(payload["session_id"]),
+                        str(payload["run_id"]),
+                        int(payload.get("sequence") or 0),
+                        str(payload["event_type"]),
+                        str(payload["status"]),
+                        str(payload["capability"]),
+                        float(payload.get("collected_at") or time.time()),
+                        self._bounded_json(payload),
+                    ),
+                )
+
     def save_graph(self, session_id: str, nodes: list[Any], edges: list[Any]) -> None:
         if not self.enabled:
             return
@@ -347,6 +429,46 @@ class PersistenceStore:
                 (evidence_id,),
             ).fetchone()
         return _row(row) if row else None
+
+    def get_telemetry_events(self, session_id: str) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM telemetry_events
+                WHERE session_id = ?
+                ORDER BY collected_at, sequence, event_id
+                LIMIT ?
+                """,
+                (session_id, self.max_export_events),
+            ).fetchall()
+        return [_row(row) for row in rows]
+
+    def export_telemetry_jsonl(self, session_id: str) -> str:
+        rows = self.get_telemetry_events(session_id)
+        return "".join(
+            json.dumps(row["payload"], ensure_ascii=False, sort_keys=True) + "\n"
+            for row in rows
+        )
+
+    def get_schema_versions(self) -> list[int]:
+        if not self.enabled:
+            return []
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        return [int(row["version"]) for row in rows]
+
+    def _bounded_json(self, value: Any) -> str:
+        payload = _json(value)
+        byte_count = len(payload.encode("utf-8"))
+        if byte_count > self.max_event_bytes:
+            raise ValueError(
+                f"telemetry payload is {byte_count} bytes; limit is {self.max_event_bytes}"
+            )
+        return payload
 
     def _save_evidence(
         self,
