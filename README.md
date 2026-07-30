@@ -33,7 +33,7 @@ Full logits and hidden tensors are discarded after compact summaries are emitted
 Python 3.11 or newer is required. On Windows, an isolated environment at a short path avoids long-path problems while installing PyTorch:
 
 ```powershell
-py -3.13 -m venv C:\Users\$env:USERNAME\.venvs\cogito-console
+py -3 -m venv C:\Users\$env:USERNAME\.venvs\cogito-console
 & C:\Users\$env:USERNAME\.venvs\cogito-console\Scripts\python.exe -m pip install -U pip
 & C:\Users\$env:USERNAME\.venvs\cogito-console\Scripts\python.exe -m pip install -e ".[dev,local]"
 & C:\Users\$env:USERNAME\.venvs\cogito-console\Scripts\python.exe -m uvicorn cogito_console.server:app --host 127.0.0.1 --port 8000
