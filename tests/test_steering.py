@@ -4,7 +4,10 @@ import socket
 import pytest
 import uvicorn
 import websockets
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
+from cogito_console import server as server_module
 from cogito_console.graph import build_token_graph
 from cogito_console.interceptor import LatentBeamInterceptor
 from cogito_console.lifecycle_logger import ContextGraphLifecycleLogger
@@ -23,13 +26,123 @@ from cogito_console.reference_provider import (
 )
 from cogito_console.router import ConfluenceRouter
 from cogito_console.schemas import CAPABILITY_NAMES, MetricValue, TelemetryEvent
-from cogito_console.server import RuntimeSession, _capability_events
+from cogito_console.server import ACCESS_COOKIE_NAME, ACCESS_TOKEN, RuntimeSession, _capability_events
 from cogito_console.transaction_log import TokenTransactionLog, normalize_splice_token
 
 
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+def test_local_access_requires_authentication_and_rejects_untrusted_hosts():
+    with TestClient(server_module.app, base_url="http://127.0.0.1") as client:
+        assert client.get("/").status_code == 200
+        unauthenticated = client.get("/api/providers")
+        assert unauthenticated.status_code == 401
+        assert unauthenticated.headers["www-authenticate"] == "Bearer"
+
+        untrusted_host = client.get(
+            "/api/providers",
+            headers={
+                "Authorization": f"Bearer {ACCESS_TOKEN}",
+                "Host": "attacker.example",
+            },
+        )
+        assert untrusted_host.status_code == 400
+        assert untrusted_host.text == "Invalid host header"
+
+        assert client.post("/auth/session", json={"token": ACCESS_TOKEN}).status_code == 403
+        invalid_login = client.post(
+            "/auth/session",
+            json={"token": "x" * 32},
+            headers={"Origin": "http://127.0.0.1"},
+        )
+        assert invalid_login.status_code == 401
+
+        login = client.post(
+            "/auth/session",
+            json={"token": ACCESS_TOKEN},
+            headers={"Origin": "http://127.0.0.1"},
+        )
+        assert login.status_code == 204
+        assert client.cookies.get(ACCESS_COOKIE_NAME) == ACCESS_TOKEN
+        cookie_header = login.headers["set-cookie"].lower()
+        assert "httponly" in cookie_header
+        assert "samesite=strict" in cookie_header
+        assert client.get("/api/providers").status_code == 200
+
+    with TestClient(server_module.app, base_url="http://127.0.0.1") as api_client:
+        bearer_response = api_client.get(
+            "/api/providers",
+            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+        )
+        assert bearer_response.status_code == 200
+
+
+def test_websocket_requires_authentication_and_exact_same_origin():
+    with TestClient(server_module.app, base_url="http://127.0.0.1") as client:
+        with pytest.raises(WebSocketDisconnect) as missing_auth:
+            with client.websocket_connect(
+                "/ws/cogito/no-auth",
+                headers={"Host": "127.0.0.1", "Origin": "http://127.0.0.1"},
+            ):
+                pass
+        assert missing_auth.value.code == 1008
+
+        login = client.post(
+            "/auth/session",
+            json={"token": ACCESS_TOKEN},
+            headers={"Origin": "http://127.0.0.1"},
+        )
+        assert login.status_code == 204
+
+        with pytest.raises(WebSocketDisconnect) as hostile_origin:
+            with client.websocket_connect(
+                "/ws/cogito/hostile-origin",
+                headers={
+                    "Cookie": f"{ACCESS_COOKIE_NAME}={ACCESS_TOKEN}",
+                    "Host": "127.0.0.1",
+                    "Origin": "https://attacker.example",
+                },
+            ):
+                pass
+        assert hostile_origin.value.code == 1008
+
+        with pytest.raises(WebSocketDisconnect) as missing_origin:
+            with client.websocket_connect(
+                "/ws/cogito/missing-origin",
+                headers={
+                    "Cookie": f"{ACCESS_COOKIE_NAME}={ACCESS_TOKEN}",
+                    "Host": "127.0.0.1",
+                },
+            ):
+                pass
+        assert missing_origin.value.code == 1008
+
+        with pytest.raises(WebSocketDisconnect) as wrong_port:
+            with client.websocket_connect(
+                "/ws/cogito/wrong-port",
+                headers={
+                    "Cookie": f"{ACCESS_COOKIE_NAME}={ACCESS_TOKEN}",
+                    "Host": "127.0.0.1",
+                    "Origin": "http://127.0.0.1:9999",
+                },
+            ):
+                pass
+        assert wrong_port.value.code == 1008
+
+        with client.websocket_connect(
+            "/ws/cogito/authorized",
+            headers={
+                "Cookie": f"{ACCESS_COOKIE_NAME}={ACCESS_TOKEN}",
+                "Host": "127.0.0.1",
+                "Origin": "http://127.0.0.1",
+            },
+        ) as websocket:
+            opened = websocket.receive_json()
+        assert opened["type"] == "session_open"
+        assert opened["session_id"] == "authorized"
 
 
 def test_rewrite_history_truncates_and_replaces_selected_token():
@@ -429,8 +542,6 @@ async def test_graph_nodes_and_edges_preserve_metric_status():
 
 @pytest.mark.anyio
 async def test_concurrent_websocket_steering_keeps_session_state_isolated():
-    from cogito_console import server as server_module
-
     original_delay = server_module.interceptor.token_delay
     server_module.interceptor.token_delay = 0.005
     port = _free_tcp_port()
@@ -481,7 +592,11 @@ async def _steered_client(
     marker = f"session_{index}_marker "
     uri = f"ws://127.0.0.1:{port}/ws/cogito/{session_id}"
 
-    async with websockets.connect(uri) as websocket:
+    async with websockets.connect(
+        uri,
+        origin=f"http://127.0.0.1:{port}",
+        additional_headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+    ) as websocket:
         await websocket.recv()
         await websocket.send(
             _json_message(

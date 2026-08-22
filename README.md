@@ -41,6 +41,8 @@ py -3 -m venv C:\Users\$env:USERNAME\.venvs\cogito-console
 
 Open `http://127.0.0.1:8000`. Cogito selects the local Transformers backend in the interface when its dependencies are installed. The first run downloads and loads the registered model; later runs reuse the local cache.
 
+The server generates a temporary access token at startup and prints it in the local terminal. Enter that token on the sign-in page. The token is exchanged for an HttpOnly, SameSite=Strict session cookie; it is never placed in the URL. Set `COGITO_ACCESS_TOKEN` to a stable URL-safe value of at least 32 characters when a fixed token is required, including any multi-worker deployment.
+
 Useful environment settings:
 
 ```powershell
@@ -50,9 +52,20 @@ $env:COGITO_MAX_INPUT_TOKENS = "512"
 $env:COGITO_MAX_NEW_TOKENS = "32"
 $env:COGITO_PERSIST = "true"
 $env:COGITO_DB_PATH = ".\data\cogito.sqlite"
+$env:COGITO_ACCESS_TOKEN = "replace-with-at-least-32-url-safe-characters"
+$env:COGITO_TRUSTED_HOSTS = "127.0.0.1,localhost"
 ```
 
 Generation settings chosen in the interface are captured per run. Model revision, tokenizer revision, dtype, quantization, seed, prompt-token count, and a reproducibility fingerprint are included in token evidence.
+
+## Local access security
+
+Cogito rejects untrusted `Host` headers before routing requests, requires authentication for static assets and every `/api` endpoint, and requires both authentication and an exact same-origin `Origin` header before accepting a WebSocket. `/health`, the local sign-in page, and its token-exchange endpoint are the only unauthenticated HTTP surfaces; the token exchange itself requires an exact same-origin request.
+
+- Keep the service bound to `127.0.0.1` unless a separately secured reverse proxy and explicit trusted hostname are configured.
+- Add only exact hostnames or IPv4 addresses to `COGITO_TRUSTED_HOSTS`; wildcards and ports are rejected.
+- Set `COGITO_SECURE_COOKIE=true` when the trusted deployment uses HTTPS.
+- Non-browser API clients may send `Authorization: Bearer <token>`. WebSocket clients must also send an `Origin` whose host and port exactly match the request authority.
 
 ## Backends and steering
 
