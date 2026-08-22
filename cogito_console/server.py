@@ -4,15 +4,21 @@ import asyncio
 import contextlib
 import json
 import os
+import re
+import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.requests import HTTPConnection
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .graph import build_context_graph, build_rewrite_graph, build_router_graph, build_token_graph, router_validation_events
 from .interceptor import LatentBeamInterceptor
@@ -42,8 +48,154 @@ from .transaction_log import TokenTransactionLog
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
+ACCESS_COOKIE_NAME = "cogito_access"
+CONFIGURED_ACCESS_TOKEN = os.getenv("COGITO_ACCESS_TOKEN")
+ACCESS_TOKEN = CONFIGURED_ACCESS_TOKEN if CONFIGURED_ACCESS_TOKEN is not None else secrets.token_urlsafe(32)
+ACCESS_TOKEN_WAS_GENERATED = CONFIGURED_ACCESS_TOKEN is None
+TRUSTED_HOSTS = tuple(
+    host.strip().lower()
+    for host in os.getenv("COGITO_TRUSTED_HOSTS", "127.0.0.1,localhost").split(",")
+    if host.strip()
+)
+SECURE_COOKIE = os.getenv("COGITO_SECURE_COOKIE", "false").strip().lower() == "true"
+
+if not re.fullmatch(r"[A-Za-z0-9_-]{32,}", ACCESS_TOKEN):
+    raise ValueError("COGITO_ACCESS_TOKEN must be at least 32 URL-safe characters")
+if not TRUSTED_HOSTS or any(
+    host == "*" or not re.fullmatch(r"[a-z0-9.-]+", host) for host in TRUSTED_HOSTS
+):
+    raise ValueError(
+        "COGITO_TRUSTED_HOSTS must contain explicit hostnames or IPv4 addresses without ports"
+    )
+
+if ACCESS_TOKEN_WAS_GENERATED:
+    print(
+        "Cogito Console generated a temporary access token. "
+        f"Enter this token on the local sign-in page: {ACCESS_TOKEN}",
+        flush=True,
+    )
+
+
+LOGIN_PAGE = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cogito Console · Local access</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+      body { background:#070a0f; color:#e7edf3; display:grid; min-height:100vh; margin:0; place-items:center; }
+      main { background:#10161b; border:1px solid #29333d; border-radius:12px; max-width:32rem; padding:2rem; width:calc(100% - 4rem); }
+      label, input, button { display:block; width:100%; }
+      input { box-sizing:border-box; margin:.75rem 0; padding:.8rem; }
+      button { background:#39d5e8; border:0; border-radius:6px; color:#071014; cursor:pointer; font-weight:700; padding:.8rem; }
+      #error { color:#ff9a9a; min-height:1.5rem; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Local access required</h1>
+      <p>Enter the access token printed in the terminal or supplied through the environment.</p>
+      <form id="login">
+        <label for="token">Access token</label>
+        <input id="token" name="token" type="password" autocomplete="off" required />
+        <button type="submit">Open Cogito Console</button>
+      </form>
+      <p id="error" role="alert"></p>
+    </main>
+    <script>
+      document.querySelector("#login").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const response = await fetch("/auth/session", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({token: document.querySelector("#token").value}),
+        });
+        if (response.ok) location.replace("/");
+        else document.querySelector("#error").textContent = "Access denied.";
+      });
+    </script>
+  </body>
+</html>
+"""
+
+
+def _valid_access_token(candidate: str | None) -> bool:
+    return bool(candidate) and secrets.compare_digest(candidate, ACCESS_TOKEN)
+
+
+def _is_authenticated(scope: Scope) -> bool:
+    connection = HTTPConnection(scope)
+    if _valid_access_token(connection.cookies.get(ACCESS_COOKIE_NAME)):
+        return True
+    scheme, _, credential = connection.headers.get("authorization", "").partition(" ")
+    return scheme.lower() == "bearer" and _valid_access_token(credential.strip())
+
+
+def _is_same_origin(scope: Scope) -> bool:
+    headers = HTTPConnection(scope).headers
+    origin = headers.get("origin")
+    host_header = headers.get("host")
+    if not origin or not host_header:
+        return False
+    try:
+        parsed_origin = urlsplit(origin)
+        parsed_host = urlsplit(f"//{host_header}")
+        origin_port = parsed_origin.port or (443 if parsed_origin.scheme == "https" else 80)
+        host_port = parsed_host.port or (443 if parsed_origin.scheme == "https" else 80)
+    except ValueError:
+        return False
+    return (
+        parsed_origin.scheme in {"http", "https"}
+        and not parsed_origin.username
+        and not parsed_origin.password
+        and not parsed_origin.query
+        and not parsed_origin.fragment
+        and parsed_origin.path in {"", "/"}
+        and parsed_origin.hostname is not None
+        and parsed_host.hostname is not None
+        and parsed_origin.hostname.lower() == parsed_host.hostname.lower()
+        and origin_port == host_port
+    )
+
+
+class AccessControlMiddleware:
+    """Require the local launch token and reject cross-origin control sockets."""
+
+    public_http_paths = frozenset({"/", "/health", "/auth/session"})
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            if scope.get("path") in self.public_http_paths or _is_authenticated(scope):
+                await self.app(scope, receive, send)
+                return
+            response = JSONResponse(
+                {"detail": "authentication required"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, receive, send)
+            return
+
+        if scope["type"] == "websocket":
+            if not _is_authenticated(scope) or not _is_same_origin(scope):
+                await send(
+                    {
+                        "type": "websocket.close",
+                        "code": 1008,
+                        "reason": "authentication and same-origin access required",
+                    }
+                )
+                return
+
+        await self.app(scope, receive, send)
 
 app = FastAPI(title="Cogito Console", version="0.3.0")
+app.add_middleware(AccessControlMiddleware)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(TRUSTED_HOSTS), www_redirect=False)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 router_layer = ConfluenceRouter()
@@ -125,8 +277,44 @@ class StreamCancellationToken:
 
 
 @app.get("/")
-async def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+async def index(request: Request) -> Response:
+    if _is_authenticated(request.scope):
+        return FileResponse(STATIC_DIR / "index.html")
+    return HTMLResponse(
+        LOGIN_PAGE,
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": (
+                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                "connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+            ),
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.post("/auth/session", status_code=204)
+async def create_access_session(request: Request) -> Response:
+    if not _is_same_origin(request.scope):
+        raise HTTPException(status_code=403, detail="same-origin request required")
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="invalid JSON") from None
+    candidate = payload.get("token") if isinstance(payload, dict) else None
+    if not isinstance(candidate, str) or not _valid_access_token(candidate):
+        raise HTTPException(status_code=401, detail="invalid access token")
+    response = Response(status_code=204)
+    response.set_cookie(
+        ACCESS_COOKIE_NAME,
+        ACCESS_TOKEN,
+        httponly=True,
+        secure=SECURE_COOKIE,
+        samesite="strict",
+        path="/",
+    )
+    return response
 
 
 @app.get("/health")
